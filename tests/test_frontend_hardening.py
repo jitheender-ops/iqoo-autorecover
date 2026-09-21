@@ -1,0 +1,335 @@
+"""
+The frontend surfaces' hardening: security headers per surface, the
+favicon, the link-preview (og:) contract, the print receipt, and the
+/foundation story page.
+
+Each test names the property it exists for. The header tests drive the REAL
+app middleware (not a re-implementation) so the posture being asserted is
+the one that ships.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from src.main import app as real_app
+
+
+def _html_client(monkeypatch: Any) -> TestClient:
+    """The real app — lifespan bypassed by TestClient's context skip, env
+    pinned to development so docs/landing all mount. A console password is
+    pinned too so the gating tests exercise the REAL session path (with no
+    password configured the console correctly serves a 200 "locked" page
+    instead of a redirect — fail-closed, and a different assertion)."""
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("DEMO_MODE", "false")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_frontend")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "x" * 8)
+    monkeypatch.setenv("RAZORPAY_WEBHOOK_SECRET", "s" * 8)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "fe-test-password")
+    from src.config import get_settings
+
+    get_settings.cache_clear()
+    return TestClient(real_app, raise_server_exceptions=False)
+
+
+# ── Security headers, per surface ───────────────────────────────────────────
+
+
+def test_html_surfaces_get_mime_sniffing_off(monkeypatch: Any) -> None:
+    """Every HTML response carries nosniff — the cheapest header, the one
+    that neutralises a whole class of old-proxy content confusion."""
+    client = _html_client(monkeypatch)
+    for path in ("/console", "/console/login", "/voice/demo"):
+        r = client.get(path)
+        if r.status_code == 200:
+            assert r.headers.get("x-content-type-options") == "nosniff", path
+
+
+def test_the_operator_surfaces_cannot_be_framed(monkeypatch: Any) -> None:
+    """The console renders live rupee figures and action buttons (dispute
+    resolution) behind a session cookie — the same UI-redress concern as
+    the money page. /voice/demo joins it: it is microphone-adjacent."""
+    client = _html_client(monkeypatch)
+    for path in ("/console", "/console/login", "/voice/demo", "/foundation"):
+        r = client.get(path)
+        assert r.headers.get("x-frame-options") == "DENY", path
+        assert "frame-ancestors 'none'" in r.headers.get(
+            "content-security-policy", ""
+        ), path
+
+
+def test_the_console_never_serves_from_a_cache(monkeypatch: Any) -> None:
+    """A console page left in a shared-browser or proxy cache is a data
+    leak; the public landing joins so stale marketing cannot outlive a
+    product change."""
+    client = _html_client(monkeypatch)
+    for path in ("/console", "/console/login", "/foundation"):
+        r = client.get(path)
+        assert r.headers.get("cache-control") == "no-store, private", path
+
+
+def test_the_api_surface_is_untouched_by_the_header_middleware(
+    monkeypatch: Any,
+) -> None:
+    """The middleware adds operator headers to HTML paths only — the JSON
+    API must not grow console headers, and /health must stay bare."""
+    client = _html_client(monkeypatch)
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert "x-frame-options" not in r.headers
+    assert "cache-control" not in r.headers
+
+
+def test_the_favicon_exists_and_is_cacheable(monkeypatch: Any) -> None:
+    """404 favicons on every page load were log noise and broken tab
+    polish on the exact URLs demoed to merchants."""
+    client = _html_client(monkeypatch)
+    r = client.get("/favicon.svg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/svg+xml"
+    assert b"<svg" in r.content
+    assert "max-age" in r.headers["cache-control"], "not cacheable"
+
+
+def test_the_og_card_is_served_at_a_stable_absolute_url(
+    monkeypatch: Any,
+) -> None:
+    """Link unfurlers fetch cold, by URL, with no session — the card must
+    exist at one absolute path, cacheable, with no secrets in it."""
+    client = _html_client(monkeypatch)
+    r = client.get("/static/og-card.svg")
+    assert r.status_code == 200
+    assert "₹11.71L" in r.content.decode(), "the card lost its headline"
+
+
+# ── The link-preview contract on templates ─────────────────────────────────
+
+
+def test_the_money_page_carries_link_preview_tags(monkeypatch: Any) -> None:
+    """The recovery link travels in an SMS; in WhatsApp/Instagram inboxes a
+    bare host with no card reads as phishing. og:* must unfurl the
+    merchant's name and the page's purpose."""
+    from src.customer import routes as customer_routes
+
+    app = FastAPI()
+    app.include_router(customer_routes.router)
+    # Mint a real token the way the demo does, against a thrown-away DB.
+    monkeypatch.setenv("RECOVERY_LINK_SECRET", "t" * 32)
+    # The 404-for-a-forged-token path still carries base.html's og block —
+    # which is exactly what an unfurler sees first.
+    r = TestClient(app).get("/recover/not-a-token")
+    assert "og:title" in r.text
+    assert "og:image" in r.text
+    assert "/static/og-card.svg" in r.text
+    assert "summary_large_image" in r.text
+
+
+def test_the_landing_carries_link_preview_tags(monkeypatch: Any) -> None:
+    client = _html_client(monkeypatch)
+    r = client.get("/console")
+    assert "og:title" in r.text and "og:image" in r.text
+    assert "favicon.svg" in r.text
+
+
+# ── /foundation — the story page ─────────────────────────────────────────────
+
+
+def test_the_foundation_page_tells_the_measured_story(monkeypatch: Any) -> None:
+    """The scroll page states the eval's real numbers and nothing softer —
+    the trust rule for a payments product is no vibes on a launch page."""
+    client = _html_client(monkeypatch)
+    r = client.get("/foundation")
+    assert r.status_code == 200
+    for fact in ("+11.03pp", "₹11.71L", "0.0%", "−0.41"):
+        assert fact in r.text, f"the story lost its number: {fact}"
+    # The one thing a launch page may never claim: that an LLM moves money.
+    assert "never authorizes" in r.text or "never authorises" in r.text
+
+
+def test_the_foundation_page_is_indexable_and_the_console_is_not(
+    monkeypatch: Any,
+) -> None:
+    """The story page is the public front door (index, follow); operator
+    pages stay noindex — their URLs carry nothing, but they are not for
+    search either."""
+    client = _html_client(monkeypatch)
+    foundation = client.get("/foundation").text
+    assert '<meta name="robots" content="index, follow">' in foundation
+    # The live console stays behind its session (303 without one) and the
+    # landing stays noindex.
+    assert client.get("/console/live", follow_redirects=False).status_code == 303
+    landing = client.get("/console").text
+    assert "noindex" in landing
+
+
+def test_the_foundation_page_reads_without_javascript(monkeypatch: Any) -> None:
+    """Progressive enhancement, enforced: the sections' content must not be
+    gated behind the observer script — it only adds emphasis classes."""
+    client = _html_client(monkeypatch)
+    r = client.get("/foundation")
+    # Content visible without JS = no section content hidden behind a
+    # script-dependent display:none. The lit-class is additive.
+    assert 'class="fm' in r.text
+    assert "IntersectionObserver" in r.text  # enhancement present
+    # The core narrative sections exist as plain HTML:
+    for heading in (
+        "Failed payments are not the end",
+        "A failed payment carries its own story",
+        "Measured, not promised",
+    ):
+        assert heading in r.text
+
+
+def test_the_root_redirects_to_the_story(monkeypatch: Any) -> None:
+    client = _html_client(monkeypatch)
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code in (302, 307)
+    assert r.headers["location"] == "/foundation"
+
+
+def test_the_story_page_is_reachable_from_the_public_pages(
+    monkeypatch: Any,
+) -> None:
+    """`/` redirects here, and for a while that was the ONLY way in: the
+    landing and the model page linked to each other and to the console, and
+    nothing linked back to the story. A front door reachable only by typing
+    the root URL is a page nobody who lands mid-site can find."""
+    client = _html_client(monkeypatch)
+    for path in ("/console", "/model"):
+        assert 'href="/foundation"' in client.get(path).text, path
+
+
+def test_the_headline_rupee_figure_is_one_number_everywhere(
+    monkeypatch: Any,
+) -> None:
+    """₹11,70,505 rounds to ₹11.71L. The landing carried a truncated
+    ₹11.70L while the story page and the README carried ₹11.71L — a reader
+    comparing two pages of the same product found two numbers."""
+    client = _html_client(monkeypatch)
+    for path in ("/console", "/foundation"):
+        body = client.get(path).text
+        assert "₹11.71L" in body, path
+        assert "₹11.70L" not in body, path
+
+
+# ── The console tour ─────────────────────────────────────────────────────────
+
+
+def test_every_tour_screenshot_the_landing_shows_is_actually_served(
+    monkeypatch: Any,
+) -> None:
+    """The twelve tour images shipped in the tree for a release before
+    anything referenced them, and nothing served them either — there is no
+    static mount in this app. Both halves are asserted here: the landing
+    names them, and each name resolves to a real webp."""
+    import re
+
+    client = _html_client(monkeypatch)
+    names = set(re.findall(r'/static/tour/([a-z_]+)\.webp', client.get("/console").text))
+    assert len(names) == 12, f"the landing lost tour shots: {sorted(names)}"
+    for name in sorted(names):
+        r = client.get(f"/static/tour/{name}.webp")
+        assert r.status_code == 200, name
+        assert r.headers["content-type"] == "image/webp", name
+        assert r.content[:4] == b"RIFF", name
+
+
+def test_an_unknown_tour_name_is_a_404_not_a_file_read(monkeypatch: Any) -> None:
+    """The path segment is checked against the directory listing taken at
+    import, so it can only ever name one of the shipped screenshots."""
+    client = _html_client(monkeypatch)
+    assert client.get("/static/tour/nope.webp").status_code == 404
+
+
+def test_the_story_page_does_not_promise_a_command_it_cannot_hand_over(
+    monkeypatch: Any,
+) -> None:
+    """
+    `./run.sh --demo` is real, and on the deployed page it was unrunnable:
+    the section said "one command, no credentials" and named no repository to
+    get the command from, directly above a button into a password wall. Both
+    halves are asserted — the repo is linked, and the page says plainly that
+    this deployment's console is gated.
+    """
+    client = _html_client(monkeypatch)
+    body = client.get("/foundation").text
+    assert "./run.sh --demo" in body
+    assert "github.com/jitheender-ops/payment-recovery-engine" in body
+    assert "behind a password" in body
+    # The old claim, which was about the deployment a reader was looking at.
+    assert "One command, no credentials" not in body
+
+
+def test_the_customer_home_carries_the_money_page_headers(monkeypatch: Any) -> None:
+    """
+    /mine has a capability token in its URL and a rupee figure on it, so it
+    needs /recover's four headers — not the API's. The three customer
+    surfaces share one path tuple in src/main.py precisely so a fourth cannot
+    be added without them: one added on its own would be framable, cacheable
+    and referrer-leaking on day one.
+
+    Asserted on a rejected token, because the middleware runs on the path and
+    the headers must not depend on the page having been served.
+    """
+    client = _html_client(monkeypatch)
+    for path in ("/recover/x.y", "/statement/x.y", "/mine/x.y"):
+        r = client.get(path)
+        assert r.headers.get("x-frame-options") == "DENY", path
+        assert "frame-ancestors 'none'" in r.headers.get(
+            "content-security-policy", ""
+        ), path
+        assert r.headers.get("cache-control") == "no-store, private", path
+        assert r.headers.get("referrer-policy") == "no-referrer", path
+
+
+def test_the_page_count_the_story_advertises_is_the_one_that_exists(
+    monkeypatch: Any,
+) -> None:
+    """
+    /foundation tells a stranger how many console pages the demo contains.
+    That is a restated number, and this repo's rule is that a restated number
+    drifts — so it is checked against the router rather than trusted. Add a
+    console page without updating the copy and this fails, which is the point:
+    the alternative is marketing that quietly becomes false.
+    """
+    import re
+
+    from fastapi.routing import APIRoute
+
+    from src.merchant.routes import router as merchant_router
+
+    # The router itself: this FastAPI wraps an included router rather than
+    # flattening it onto the app, so app.routes carries no APIRoute and any
+    # count taken from it is zero.
+    gated = {
+        route.path
+        for route in merchant_router.routes
+        if isinstance(route, APIRoute)
+        and "GET" in route.methods
+        and route.path.startswith("/console")
+        # The public landing and the login door are not gated pages.
+        and route.path not in ("/console", "/console/login")
+    }
+
+    assert gated, "route introspection found nothing — the walk is broken"
+
+    words = {
+        20: "twenty", 21: "twenty-one", 22: "twenty-two", 23: "twenty-three",
+        24: "twenty-four", 25: "twenty-five", 26: "twenty-six",
+        27: "twenty-seven", 28: "twenty-eight", 29: "twenty-nine",
+        30: "thirty",
+    }
+    expected = words.get(len(gated))
+    assert expected, f"{len(gated)} gated pages — extend the number words"
+
+    body = _html_client(monkeypatch).get("/foundation").text
+    claimed = re.search(r"<b>([a-z-]+) console pages</b>", body)
+    assert claimed, "/foundation stopped stating a page count"
+    assert claimed.group(1) == expected, (
+        f"/foundation says {claimed.group(1)} console pages; the router has "
+        f"{len(gated)} ({expected})"
+    )

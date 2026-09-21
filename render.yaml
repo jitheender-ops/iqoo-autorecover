@@ -1,0 +1,295 @@
+# Render blueprint. Create from the dashboard: New > Blueprint > point at this repo.
+#
+# What this wires up:
+#   recovery-api           the FastAPI service — the Razorpay webhook URL AND
+#                          the whole console. ONE site: ledger, pipeline,
+#                          routing, cases, engine, evidence.
+#
+#   recovery-db            Render Postgres — see the 30-DAY note below
+#
+# There was a second service (recovery-dashboard, Streamlit) until everything
+# it showed moved under /console/. Two consoles meant two hosts, two passwords
+# and two cold starts on a plan where each service sleeps independently — and
+# the operator one sat silently broken for months because nobody had a reason
+# to open it. One site is fewer moving parts AND the only way a merchant sees
+# the whole picture without being told which URL to use. dashboard/ still runs
+# locally (`streamlit run dashboard/app.py`) for anyone who wants the plotly
+# charts; it is simply not deployed.
+#
+# Migrations are NOT a preDeployCommand (that is a paid-plan feature). They run
+# in docker-entrypoint.sh before uvicorn starts, so `alembic upgrade head`
+# happens on every boot on any plan. It is idempotent — every step is guarded
+# by an inspector check — so repeated boots are no-ops.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# ONE DATABASE, ZERO CONNECTION STRINGS TO COPY
+#
+# Postgres is a RENDER database, provisioned by the `databases:` block below.
+# Render injects the connection string into both services; nothing about it is
+# typed by hand, so it cannot be typed wrong.
+#
+# DATABASE_URL and DATABASE_URL_SYNC are deliberately the SAME injected value.
+# src/config.py normalises each to the driver it needs — `+asyncpg` for the
+# app, plain for Alembic — and its _ensure_sync_driver validator exists for
+# exactly this case. There is no pooler here: a Render database hands out real
+# connections, so the FOR UPDATE row lock in orchestrator._get_ledger behaves,
+# and DB_BEHIND_POOLER stays at its default of false (a normal pool, asyncpg's
+# prepared-statement cache left on).
+#
+# `property: connectionString` is the INTERNAL address. It resolves only inside
+# Render's network, which is what you want: the database never needs a public
+# endpoint, and internal traffic does not cross the internet. If you ever need
+# to reach it from your laptop, read externalConnectionString from the
+# dashboard rather than changing this.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# THE 30-DAY CATCH — READ THIS ONE
+#
+# Render's FREE Postgres is DELETED 30 days after it is created. Render emails
+# a warning first, but when it expires the data is gone, not archived. That is
+# the trade for the simplicity above.
+#
+# For a prototype and a demo, this is usually the right trade — the engine's
+# state is recoverable (re-push risk events, re-run the webhook simulator) and
+# nothing here is a system of record yet.
+#
+# When it needs to outlive a month, ONE of:
+#   * `plan: 0.1c-256mb` (or higher) on the database below — the smallest paid
+#     tier, no code change, no migration;
+#   * or move to a managed Postgres elsewhere and set DATABASE_URL /
+#     DATABASE_URL_SYNC by hand (`sync: false`). Supabase works — use its
+#     SESSION pooler on 5432 for DATABASE_URL, never the transaction pooler on
+#     6543, which would silently break that row lock; and set
+#     DB_BEHIND_POOLER=true so the async pool shrinks and asyncpg's statement
+#     cache goes off. docs/DEPLOY.md carries the full version of that path.
+# ─────────────────────────────────────────────────────────────────────────
+
+# PLAN NAMES ARE NOT FREE TEXT. Render rejects an unknown one at blueprint
+# parse time, so they are written down here rather than guessed at:
+#
+#   databases       free · 0.1c-256mb · 0.5c-1g · 1c-2g · 1c-4g · 2c-4g · ...
+#   web services    free · 0.5c-512mb · 1c-2g · 2c-4g · 2c-8g · 4c-8g · ...
+#
+# The old `starter` / `standard` / `basic-*` names are gone. Region is omitted
+# throughout, which defaults everything to `oregon` — services and the database
+# must share a region or `property: connectionString` (the INTERNAL address)
+# resolves to nothing.
+databases:
+  - name: recovery-db
+    plan: free
+    databaseName: payment_recovery
+    user: recovery
+
+# ─────────────────────────────────────────────────────────────────────────
+# BOTH SERVICES ARE ON THE FREE PLAN. WHAT THAT COSTS.
+#
+# This is a prototype deployment and the free plan is the deliberate choice.
+# Render's free web services sleep after ~15 minutes with no inbound request,
+# and Layer 6 is an in-process asyncio loop, so while asleep:
+#
+#   * a deferred `retry_at` scheduled for +4h does not fire at +4h — it fires
+#     whenever something next wakes the service;
+#   * `reconcile_events`, `expire_promises` and the chase sweeps stop on the
+#     same clock;
+#   * a cold start takes tens of seconds and can outrun Razorpay's webhook
+#     delivery timeout.
+#
+# Nothing is LOST. A scheduled attempt stays "scheduled" and fires late; a
+# timed-out webhook is not a 200, so Razorpay re-sends it, and reconcile_events
+# picks up anything stored but unprocessed. What is lost is punctuality.
+#
+# Demoing: hit /health a minute before you show the chasers, and read the
+# console's heartbeat strip — it says out loud whether the engine is ticking,
+# so a sleeping service never reads as a broken one. Optional and zero code: a
+# free external cron on GET /health every 10 min keeps recovery-api awake, but
+# the free allowance is ~750 instance-hours against a 744-hour month, so let
+# recovery-dashboard sleep if you do that.
+#
+# When this stops being a prototype: `plan: 0.5c-512mb` on recovery-api. One
+# line, no code. See docs/DEPLOY.md.
+# ─────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── API ───────────────────────────────────────────────────────────────
+  - type: web
+    name: recovery-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    # The entrypoint's "api" mode: alembic upgrade head, then uvicorn.
+    dockerCommand: /app/docker-entrypoint.sh api
+    envVars:
+      # The SAME injected value twice, on purpose — src/config.py gives each
+      # the driver it needs. Nothing to copy, so nothing to copy wrong.
+      - key: DATABASE_URL
+        fromDatabase: {name: recovery-db, property: connectionString}
+      - key: DATABASE_URL_SYNC
+        fromDatabase: {name: recovery-db, property: connectionString}
+      # DB_BEHIND_POOLER is deliberately absent: it defaults to false, and a
+      # Render database is a direct connection with no pooler in front. Set it
+      # to "true" only if DATABASE_URL is ever repointed at a pooled provider.
+
+      # staging, not production: `production` is equally valid here, but either
+      # closes /docs and /redoc and puts /openapi.json behind X-API-Key. Do not
+      # set `development` on a public URL — it opens the whole schema.
+      - key: APP_ENV
+        value: staging
+      - key: LOG_LEVEL
+        value: INFO
+      # One worker on the free plan. Each worker runs its own scheduler loop;
+      # they are safe together (both sweeps claim rows with a conditional
+      # UPDATE) but on a 512MB instance the memory matters more.
+      #
+      # This used to be load-bearing for a second reason: the rate-limit
+      # buckets lived per worker, so N workers quietly multiplied every per-IP
+      # limit N times. That is no longer true WHEN REDIS_URL is set — the
+      # limiter is then shared across replicas (src/rate_limit.py). Without
+      # Redis the per-process buckets are back and this pin still is the limit.
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # Render terminates TLS at its own proxy, which appends the real client
+      # to X-Forwarded-For. The rate limits read the RIGHTMOST (proxy-added)
+      # entry only, and only when this is set — without it they would key on
+      # the socket peer, which behind Render's LB is the proxy itself, i.e.
+      # one single "client" for the whole internet.
+      - key: BEHIND_TRUSTED_PROXY
+        value: "true"
+      # Render's LB is a single hop, so the client is the rightmost
+      # X-Forwarded-For entry. Raise this to 2 if you put a CDN in front of
+      # Render — otherwise the rightmost entry becomes a constant internal
+      # address and every visitor shares one rate-limit bucket.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      # TRUSTED_PROXY_IPS is deliberately ABSENT: Render's proxy is the only
+      # way into this service, so trusting the header from any peer is safe
+      # here. Set it (to your proxies' IPs/CIDRs) only if this service ever
+      # becomes reachable outside Render's LB — e.g. you publish the container
+      # port directly — because a direct connection can then pad
+      # X-Forwarded-For and spoof every per-IP limit and the webhook allowlist.
+      - key: SCHEDULER_ENABLED
+        value: "true"
+      - key: SCHEDULER_INTERVAL_SECONDS
+        value: "60"
+
+      - key: LLM_PROVIDER
+        value: openai
+      # Groq's OpenAI-compatible endpoint — free tier, no per-account daily
+      # cap like OpenRouter's shared free-model pool. Swap back to unset (or
+      # api.openai.com) if a real OpenAI key is ever used instead.
+      - key: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+
+      # sync: false = "prompt me in the dashboard, never store in git".
+      # Set each of these once, under the service's Environment tab.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      # Keys the HMAC on POST /risks (merchant-pushed risk events for the four
+      # chasers). Shared with the merchant's systems, so it is set by hand,
+      # never generated. Empty = /risks rejects everything.
+      - key: RISK_WEBHOOK_SECRET
+        sync: false
+      # A Groq API key, despite the OpenAI-shaped variable name — the openai
+      # SDK client just points at LLM_BASE_URL above. Set by hand in the
+      # dashboard, same as the other secrets on this list.
+      - key: OPENAI_API_KEY
+        sync: false
+      # Set this and flip LLM_PROVIDER to `anthropic` (clearing LLM_BASE_URL
+      # and setting LLM_MODEL to a claude-* id) to run the policy agent on
+      # Claude instead of the Groq free tier. Wired here so that switch is a
+      # dashboard edit, not a blueprint change — without the key present the
+      # provider cannot be switched at all.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: openai/gpt-oss-20b
+      - key: API_KEY
+        generateValue: true          # guards /openapi.json outside development
+      - key: DASHBOARD_PASSWORD
+        sync: false                  # gates /console/live
+
+      # ── Customer recovery page ──────────────────────────────────────
+      # Signs /recover/<token>. generateValue means Render mints it once and
+      # keeps it — nobody has to invent, paste or store a secret by hand, and
+      # it never touches git. A dedicated secret, not the webhook one.
+      - key: RECOVERY_LINK_SECRET
+        generateValue: true
+      # The merchant's display name — the trust anchor on the recovery page
+      # and in SMS. Public information; an unnamed payment link reads as
+      # phishing, so set this to the name customers actually know.
+      - key: MERCHANT_NAME
+        sync: false
+      # Optional WhatsApp support number (digits only, with country code).
+      # Empty hides the button; the page falls back to "reply to our message".
+      - key: SUPPORT_WHATSAPP
+        sync: false
+      # Keys the HMAC that masks customer identifiers inside LLM prompts.
+      # Dedicated for the same reason RECOVERY_LINK_SECRET is: the webhook
+      # secret proves Razorpay's identity and must not unmask customers too.
+      - key: PII_MASK_SECRET
+        generateValue: true
+      # Keys the case_events hash chain. The scheduler stamps every new event
+      # each tick, and Settings.require_production_integrity REFUSES to boot
+      # without this — an unkeyed chain leaves every audit row unstamped while
+      # the rest of the service works perfectly, which is the quiet kind of
+      # broken. generateValue: Render mints it once and keeps it. Do NOT rotate
+      # casually: rotating invalidates every stamp already written.
+      - key: AUDIT_CHAIN_SECRET
+        generateValue: true
+      # The origin customers open the link on. Taken from the service itself so
+      # it is correct the moment the service exists; override with a custom
+      # domain once you have one, since an onrender.com host in an SMS asking
+      # for money is not a link most people would trust.
+      - key: PUBLIC_BASE_URL
+        fromService: {type: web, name: recovery-api, property: host}
+
+      # ── Promise-backed UPI Autopay (opt-in, off by default) ──────────
+      # OFF until Razorpay's Recurring Payments is enabled on the account.
+      # An engine that offers a customer an autopay it cannot charge has made
+      # a promise of its own that it will break, so this stays false until the
+      # authorisation round trip has been run on the test account once.
+      - key: PROMISE_MANDATE_ENABLED
+        value: "false"
+      # Ceiling on a single unattended debit, in PAISE. RBI exempts e-mandate
+      # debits from per-transaction authentication only below a threshold;
+      # above it the option is not offered at all and the promise falls back to
+      # the trust-based one. ₹15,000 is the general limit and the right value
+      # for merchant collection. The raised ceilings are category-specific
+      # (card bills, insurance, mutual funds) — leave this alone unless you
+      # operate in one of those.
+      - key: MANDATE_MAX_AUTO_DEBIT_PAISE
+        value: "1500000"        # ₹15,000
+
+      # ── Voice chaser (opt-in, off by default) ────────────────────────
+      # Off until DoT/TCCCP registration and the call-start AI disclosure
+      # are sorted. Flipping this to "true" is the actual "turn calls on"
+      # switch; the two secrets below can be set in advance safely.
+      - key: VOICE_CHASER_ENABLED
+        value: "false"
+      # Verifies inbound POST /voice/turn webhooks. Set by hand in the
+      # dashboard, same as the other secrets on this list.
+      - key: VOICE_WEBHOOK_SECRET
+        sync: false
+      - key: SARVAM_API_KEY
+        sync: false
+
+      # ── Plivo call leg (src/voice/plivo_bridge.py) ────────────────────
+      # All optional and fail-closed: without every one of these the bridge
+      # refuses to run and /plivo/* callbacks answer 401 (no secret) —
+      # nothing else about the deployment changes. Fill these only when a
+      # Plivo account exists; docs/VOICE_CALL_SETUP.md is the runbook.
+      # PLIVO_BRIDGE_BASE_URL is the public host of THIS service (Plivo
+      # must fetch the XML and audio over the internet), which on Render is
+      # the same origin as PUBLIC_BASE_URL.
+      - key: PLIVO_AUTH_ID
+        sync: false
+      - key: PLIVO_AUTH_TOKEN
+        sync: false
+      - key: PLIVO_CALLER_NUMBER
+        sync: false
+      - key: PLIVO_BRIDGE_BASE_URL
+        fromService: {type: web, name: recovery-api, property: host}

@@ -1,0 +1,328 @@
+{% extends "base.html" %}
+{% from "_console_nav.html" import console_nav %}
+{% from "_console_shared.html" import console_styles, recovery_decision %}
+{% block title %}{{ data.case.ref if data.case else "Case" }} · Recovery Console{% endblock %}
+{% block head %}{{ console_styles() }}
+<style>
+  .chain{{ '{' }}border-left:2px solid var(--line);margin:1rem 0 0;padding:0 0 0 1.25rem{{ '}' }}
+  .chain > li{{ '{' }}list-style:none;position:relative;padding:0 0 1.15rem{{ '}' }}
+  .chain > li::before{{ '{' }}content:"";position:absolute;left:-1.68rem;top:.42rem;
+    width:9px;height:9px;border-radius:50%;background:var(--line);
+    box-shadow:0 0 0 3px var(--bg){{ '}' }}
+  .chain > li.on::before{{ '{' }}background:var(--green){{ '}' }}
+  .chain > li.off::before{{ '{' }}background:var(--red){{ '}' }}
+  .chain-k{{ '{' }}font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;
+    color:var(--ink-3);font-weight:600{{ '}' }}
+  .chain-v{{ '{' }}margin:.15rem 0 0;font-size:.95rem{{ '}' }}
+
+  /* The guardrail checklist. A tick is never the only signal — the verdict
+     is a word beside it, per MASTER.md's non-negotiable. */
+  .gr-list{{ '{' }}list-style:none;margin:1.1rem 0 0;padding:0;
+    display:grid;gap:.1rem{{ '}' }}
+  .gr-rule{{ '{' }}display:grid;grid-template-columns:1.4rem 1fr;gap:.7rem;
+    align-items:baseline;padding:.5rem .2rem;
+    border-bottom:1px solid var(--line){{ '}' }}
+  .gr-rule:last-child{{ '{' }}border-bottom:none{{ '}' }}
+  .gr-mark{{ '{' }}font-family:var(--mono);font-size:.9rem;text-align:center{{ '}' }}
+  .gr-ok .gr-mark{{ '{' }}color:var(--green){{ '}' }}
+  .gr-fired .gr-mark{{ '{' }}color:var(--red){{ '}' }}
+  .gr-label{{ '{' }}font-size:.92rem{{ '}' }}
+  .gr-verdict{{ '{' }}font-family:var(--mono);font-size:.62rem;font-weight:600;
+    letter-spacing:.1em;text-transform:uppercase;margin-left:.5rem;
+    color:var(--ink-3){{ '}' }}
+  .gr-fired .gr-verdict{{ '{' }}color:var(--red){{ '}' }}
+  .gr-detail{{ '{' }}margin:.25rem 0 0;font-size:.83rem;color:var(--ink-2);
+    max-width:62ch{{ '}' }}
+</style>
+{% endblock %}
+
+{% block body %}
+{{ console_nav("cases", merchant_name, nav) }}
+<main id="main" class="wrap">
+{% if not db_ok %}
+  <div class="empty"><b>Can't reach the database.</b>
+  <p>Every figure here is read live, so there is nothing cached to fall back on.</p></div>
+{% elif not data.case %}
+  <div class="empty"><b>No such case.</b>
+  <p>The id in the URL does not match a recovery case. It may have been from
+  a different database — the demo's SQLite file is rebuilt from scratch each
+  time you reseed.</p></div>
+{% else %}
+  {% set c = data.case %}
+  <header class="phead">
+    <div class="peyebrow">Recovery case · {{ c.risk_type }}</div>
+    <h1 class="ptitle mono">{{ c.ref }}</h1>
+    <p class="psub">Opened {{ c.opened }} IST ·
+      attempt {{ c.attempts_used }} of {{ c.max_attempts }} ·
+      state <strong>{{ c.state }}</strong></p>
+  </header>
+
+  {# ── Money first, and the distinction the headline depends on ──────── #}
+  <section class="money">
+    <div class="money-half">
+      <span class="money-label">{{ "Recovered" if c.recovered else "Still owed" }}</span>
+      <span class="money-value {{ 'green' if c.recovered else 'red' }}">{{ c.recovered or c.outstanding }}</span>
+      <span class="money-foot">
+        {% if c.recovered and c.attributed %}
+          Attributed to an attempt this engine made{% if c.recovered_ref %},
+          paid as <span class="mono">{{ c.recovered_ref }}</span>{% endif %}.
+        {% elif c.recovered %}
+          The money arrived without us — the customer paid directly, so this
+          is revenue but <strong>not</strong> the engine's to claim.
+        {% else %}
+          of {{ c.at_risk }} at risk when the case opened.
+        {% endif %}
+      </span>
+    </div>
+  </section>
+
+  {# ── The customer's own view of this case ───────────────────────────────
+     The whole page below is the engine's side of the story. This is the one
+     line that crosses over: the page the person on the other end was handed.
+     No link is printed — /console/customer explains why, and the POST there
+     mints a fresh hour-long one and audits it. #}
+  <section class="sec">
+    <h2 class="sec-t">What the customer sees</h2>
+    <p class="sec-s">
+      Their page shows this amount, what went wrong in their words, and the
+      ways out of it — pay, promise a date, ask for instalments, or stop
+      hearing from you. Opening it records that <em>you</em> looked, so their
+      click-through figures stay theirs.
+    </p>
+    <form method="post" action="/console/customer/open" style="margin:.9rem 0 0">
+      <input type="hidden" name="case_id" value="{{ data.case.case_id }}">
+      <button class="btn btn-ghost btn-sm" type="submit">Open their page</button>
+    </form>
+  </section>
+
+  {# ── The loop, end to end ───────────────────────────────────────────── #}
+  <section class="sec">
+    <h2 class="sec-t">The decision chain</h2>
+    <p class="sec-s">Every link below is read from the row the engine wrote at
+      the time. Nothing here is reconstructed or inferred.</p>
+    <ul class="chain">
+      <li class="on">
+        <div class="chain-k">Signal</div>
+        <p class="chain-v">{{ c.risk_type }} on <span class="mono">{{ c.ref }}</span>,
+          {{ c.at_risk }} at risk.</p>
+      </li>
+
+      {% if c.diagnosis %}
+      <li class="{{ 'on' if c.diagnosis.retryable else 'off' }}">
+        <div class="chain-k">Diagnosis</div>
+        <p class="chain-v">
+          <strong>{{ c.diagnosis.failure_class }}</strong> —
+          {{ "retryable" if c.diagnosis.retryable else "not retryable" }}.
+          Classified deterministically from the gateway's own 5-tuple:
+          <span class="mono">{{ c.diagnosis.error_reason or "—" }}</span>
+          ({{ c.diagnosis.error_code }}{% if c.diagnosis.error_source %},
+          source {{ c.diagnosis.error_source }}{% endif %}{% if c.diagnosis.error_step %},
+          step {{ c.diagnosis.error_step }}{% endif %}).
+          {% if c.diagnosis.method %}Paid by {{ c.diagnosis.method }}{% if c.diagnosis.bank %}
+          · {{ c.diagnosis.bank }}{% endif %}.{% endif %}
+        </p>
+      </li>
+      {% endif %}
+
+      {% for a in c.attempts %}
+      {{ recovery_decision(a) }}
+      {% endfor %}
+
+      {% if not c.attempts %}
+      <li class="off">
+        <div class="chain-k">Execution</div>
+        <p class="chain-v">No attempt was ever made. Either the guardrail
+          refused before one could be, or the agent chose to abandon —
+          the stopping rule below says which.</p>
+      </li>
+      {% endif %}
+
+      <li class="{{ 'off' if c.stop_reason else 'on' }}">
+        <div class="chain-k">Stopping rule</div>
+        <p class="chain-v">
+          {% if c.stop_reason %}
+            {# Verbatim from cases.stop_reason(). Re-wording it here would
+               make the console and the engine disagree about why. #}
+            <strong>Stopped.</strong> {{ c.stop_reason }}
+          {% else %}
+            The engine may act on this case right now — no rule is holding it.
+          {% endif %}
+          {% if c.disputed %}<br><strong>Disputed:</strong> chasing is frozen
+          until a person decides. That is a compliance stop, not a backlog.{% endif %}
+        </p>
+      </li>
+
+      <li class="{{ 'on' if c.recovered else 'off' }}">
+        <div class="chain-k">Outcome</div>
+        <p class="chain-v">
+          {% if c.recovered %}Recovered {{ c.recovered }}.
+          {% else %}{{ c.outstanding }} still outstanding.
+          {% if c.close_reason %}<br><span class="sec-s">{{ c.close_reason }}</span>{% endif %}
+          {% endif %}
+        </p>
+      </li>
+    </ul>
+  </section>
+
+  {# ── The gate, rule by rule ───────────────────────────────────────────
+     The chain above says WHETHER the guardrail agreed and quotes its refusal.
+     This says what else ran — so an approval reads as "eleven named rules
+     ran and none fired" rather than "nothing objected", which is the actual
+     claim and the more interesting one. Reconstructed, never re-run:
+     re-validating now would answer "would this pass today", against a clock
+     and a budget that have both moved. #}
+  {% set gr = data.guardrail %}
+  {% if gr %}
+  <section class="sec">
+    <h2 class="sec-t">What the guardrail checked</h2>
+    {% if gr.skipped %}
+      <p class="sec-s">
+        The last decision was <strong>abandon</strong>, and the gate does not
+        run for one — there is nothing to bound when nothing is being spent.
+        It is recorded as passed because refusing an abandon would be refusing
+        to stop.
+      </p>
+    {% else %}
+      <p class="sec-s">
+        Attempt {{ gr.attempt }}, action <strong>{{ gr.action }}</strong>.
+        {% if gr.passed %}
+          All {{ gr.checked }} rules ran and none fired. The gate never
+          stops at the first violation, so an approval means every one of
+          these was checked, not that the first one passed.
+        {% else %}
+          {{ gr.failed }} of {{ gr.checked }} rules refused it.
+          Everything else on this list passed — the gate collects all
+          violations rather than stopping at the first.
+        {% endif %}
+      </p>
+
+      {% if gr.unattributed %}
+      {# The stored reason matched no rule's prefix: a rule was renamed or its
+         message changed and gate.RULE_LABELS has drifted. Said out loud
+         rather than drawn as a clean sheet. #}
+      <div class="empty" style="margin-top:1rem">
+        <b>This refusal could not be matched to a rule.</b>
+        <p>The gate recorded: <span class="mono">{{ gr.reason }}</span>.
+        The checklist below may be describing the wrong rules — a message
+        changed without its label in <span class="mono">guardrail/gate.py</span>.</p>
+      </div>
+      {% endif %}
+
+      <ul class="gr-list">
+        {% for rule in gr.rules %}
+        <li class="gr-rule {{ 'gr-fired' if rule.fired else 'gr-ok' }}">
+          <span class="gr-mark" aria-hidden="true">{{ "✕" if rule.fired else "✓" }}</span>
+          <div>
+            <span class="gr-label">{{ rule.label }}</span>
+            <span class="gr-verdict">{{ "refused" if rule.fired else "passed" }}</span>
+            {% if rule.detail %}
+            <p class="gr-detail">{{ rule.detail }}</p>
+            {% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {# ── Money that arrived another way ─────────────────────────────────────
+     NEFT, a cheque, cash, a UPI transfer the merchant took by hand. None of
+     it touches Razorpay, so no webhook can ever tell us — the console showed
+     an outstanding balance it had no way to let anyone close, and the case
+     went on spending attempts chasing money already in the bank.
+
+     Counted, never CLAIMED: recorded exactly like self-recovery, so
+     amount_recovered rises and recovered_via_attempt_id stays NULL. #}
+  {% if c.state == "open" %}
+  <section class="sec">
+    <h2 class="sec-t">Money arrived another way</h2>
+    <p class="sec-s">
+      Record a payment that reached you outside the payment rail. The case
+      closes and stops chasing. It counts toward recovered money but is never
+      attributed to the engine.
+    </p>
+    <form method="post" action="/console/case/paid" class="paidform">
+      <input type="hidden" name="case_id" value="{{ c.case_id }}">
+      <label class="paid-f">
+        <span>Amount in rupees</span>
+        <input type="number" name="amount_inr" min="1" step="1" required
+               inputmode="numeric" aria-label="Amount received, in rupees">
+      </label>
+      <label class="paid-f">
+        <span>Your reference</span>
+        <input type="text" name="paid_ref" maxlength="255" required
+               placeholder="UTR or cheque number"
+               aria-label="Your own reference for this payment">
+      </label>
+      <label class="paid-f">
+        <span>How</span>
+        <select name="method" aria-label="How the money arrived">
+          <option value="neft">NEFT</option>
+          <option value="rtgs">RTGS</option>
+          <option value="imps">IMPS</option>
+          <option value="cheque">Cheque</option>
+          <option value="cash">Cash</option>
+          <option value="upi_manual">UPI, by hand</option>
+        </select>
+      </label>
+      <button class="btn-mini" type="submit">Record it</button>
+    </form>
+  </section>
+  {% endif %}
+
+  {# ── Account 360, where there is an account ─────────────────────────── #}
+  {% if c.account %}
+  <section class="sec">
+    <h2 class="sec-t">{{ c.account.name }}</h2>
+    <p class="sec-s">Everything else open on this buyer's account. B2B
+      collection runs on the account, not the invoice — one ladder position,
+      one contact budget.</p>
+    {% if c.account.siblings %}
+    <div class="tablewrap" style="margin-top:.9rem">
+      <table><thead><tr><th>Invoice</th><th>State</th><th class="n">Outstanding</th></tr></thead>
+      <tbody>
+      {% for s in c.account.siblings %}
+        <tr>
+          <td><a class="mono" href="/console/case/{{ s.case_id }}">{{ s.ref }}</a></td>
+          <td>{{ s.state }}</td><td class="n">{{ s.amount }}</td>
+        </tr>
+      {% endfor %}
+      </tbody></table>
+    </div>
+    {% else %}<p class="sec-s">Nothing else open on this account.</p>{% endif %}
+  </section>
+  {% endif %}
+
+  {# ── The audit trail ────────────────────────────────────────────────── #}
+  <section class="sec">
+    <h2 class="sec-t">Audit trail</h2>
+    <p class="sec-s">Append-only, in order. A sealed row is inside the
+      hash chain <span class="mono">scripts/audit_chain.py --verify</span>
+      checks — so "auditable" is something you can test, not something this
+      page asserts.</p>
+    <div class="tablewrap" style="margin-top:.9rem">
+      <table>
+        <thead><tr><th>When (IST)</th><th>Event</th><th>Actor</th><th>Detail</th></tr></thead>
+        <tbody>
+        {% for e in c.events %}
+          <tr>
+            <td class="mono">{{ e.at }}</td>
+            <td>{{ e.type }}{% if e.sealed %} <span class="pill pill-g">sealed</span>{% endif %}</td>
+            <td>{{ e.actor }}</td>
+            <td class="sec-s" style="margin:0">
+              {% for k, v in e.detail.items() %}
+                <span class="mono">{{ k }}</span>={{ v }}{% if not loop.last %} · {% endif %}
+              {% endfor %}
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="sec-s">No events recorded for this case.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endif %}
+</main>
+{% endblock %}

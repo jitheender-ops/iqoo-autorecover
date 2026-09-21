@@ -1,0 +1,268 @@
+"""
+LLM-based policy agent for payment retry decisions.
+
+Calls Claude or GPT with structured output enforcing the RetryAction schema.
+Falls back to a safe abandon action on any failure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+from src.agent.actions import FailureContext, RetryAction
+from src.agent.prompts import SYSTEM_PROMPT, format_user_prompt
+from src.config import get_settings
+from src.llm import build_llm_client
+
+logger = logging.getLogger(__name__)
+
+# Pause before the one transient retry. Short on purpose: the caller (a webhook
+# background task or an eval prefetch) is waiting, and a rate limit usually
+# clears in single-digit seconds.
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.0
+# A 429's Retry-After names the real window; honour it when present, clamped:
+# a provider asking to wait minutes would stall the webhook far past sane,
+# so past this ceiling we take the XGBoost fallback and let the next decision
+# retry the provider on its own.
+_MAX_RATE_LIMIT_WAIT_SECONDS = 20.0
+
+
+def _rate_limit_wait(e: BaseException) -> float | None:
+    """Seconds the provider's Retry-After asks for, or None if not a 429/none."""
+    if getattr(e, "status_code", None) != 429 and getattr(e, "code", None) != 429:
+        return None
+    import re
+
+    m = re.search(r"try again in ([\d.]+)s", str(e), re.IGNORECASE)
+    if not m:
+        m = re.search(r"retry.?after[=:] ?([\d.]+)", str(e), re.IGNORECASE)
+    if not m:
+        return _TRANSIENT_RETRY_BACKOFF_SECONDS
+    return min(float(m.group(1)), _MAX_RATE_LIMIT_WAIT_SECONDS)
+
+
+class PolicyAgent:
+    """
+    LLM-based policy agent. Decides the recovery action for a failed payment.
+
+    Supports Anthropic (Claude) and OpenAI (GPT) as providers.
+    Constrained to the fixed RetryAction action space — never freeform.
+    """
+
+    def __init__(self, provider: str | None = None) -> None:
+        settings = get_settings()
+        self._provider = provider or settings.llm_provider
+        self._model = settings.llm_model
+        self._temperature = settings.llm_temperature  # OpenAI path only
+        self._effort = settings.llm_effort
+        self._max_tokens = settings.llm_max_tokens
+        self._timeout = settings.llm_timeout_seconds
+
+        # One client for either provider, built by the shared src/llm.py path
+        # (Any: two SDK clients with entirely different shapes, and the branch
+        # keys off a str setting, which mypy cannot use to narrow a union).
+        self._client: Any = build_llm_client(timeout=self._timeout)
+
+        # Counts decisions that came from _fallback_action rather than the LLM.
+        # PolicyAgent.decide() swallows LLM errors and returns a heuristic action
+        # that is indistinguishable from a real decision at the call site — so
+        # without this counter a totally dead LLM still yields a full, plausible
+        # results table. Callers must check it before labelling output "LLM".
+        self.call_count = 0
+        self.fallback_count = 0
+        # HTTP status of the last unrecoverable API failure, surfaced so callers
+        # can stop early. decide() swallows its own errors by design, so without
+        # this a bad key or empty balance is invisible above this class.
+        self.last_error_status: int | None = None
+        # Human-readable companion to last_error_status (eval/policies reads
+        # it via getattr with a default, but it is a real field, set on the
+        # same path as the status).
+        self.last_error_detail: str | None = None
+
+        logger.info("PolicyAgent initialized: provider=%s, model=%s", self._provider, self._model)
+
+    async def decide(self, context: FailureContext) -> RetryAction:
+        """
+        Decide the recovery action for a failed payment.
+
+        Args:
+            context: Full failure context with payment, customer, and temporal info.
+
+        Returns:
+            RetryAction — validated, constrained action from the fixed action space.
+        """
+        user_prompt = format_user_prompt(context)
+        self.call_count += 1
+
+        try:
+            try:
+                raw_response = await self._call_llm(user_prompt)
+            except Exception as first_error:
+                # One retry on transient failures. A 429 or a blipped 503 is
+                # seconds away from being a real decision; degrading the very
+                # first hiccup to the XGBoost fallback threw away exactly the
+                # calls a rate limit was most likely to interrupt mid-eval.
+                # Fatal statuses (bad key, no credits, unknown model) skip it —
+                # retrying those only burns time before the same answer.
+                status = getattr(first_error, "status_code", None)
+                if status in (401, 402, 403, 404):
+                    raise
+                # A rate limit names its own window — honour it rather than
+                # guessing 1s and hitting the same wall twice.
+                wait = _rate_limit_wait(first_error)
+                if wait is not None:
+                    logger.warning(
+                        "LLM rate-limited — waiting %.1fs per the provider's "
+                        "own window, then retrying once", wait,
+                    )
+                else:
+                    wait = _TRANSIENT_RETRY_BACKOFF_SECONDS
+                    logger.warning(
+                        "Transient LLM failure (%s) — retrying once",
+                        str(first_error)[:120],
+                    )
+                await asyncio.sleep(wait)
+                raw_response = await self._call_llm(user_prompt)
+
+            action = self._parse_response(raw_response)
+
+            if action is None:
+                # Retry once with a correction prompt
+                logger.warning("First LLM response failed to parse, retrying with correction")
+                correction = (
+                    f"Your previous response was not valid JSON:\n{raw_response}\n\n"
+                    "Please respond with ONLY a valid JSON object matching the RetryAction schema."
+                )
+                raw_response = await self._call_llm(correction)
+                action = self._parse_response(raw_response)
+
+            if action is None:
+                logger.error("LLM failed to produce valid action after retry — falling back")
+                self.fallback_count += 1
+                return self._fallback_action(context, "LLM output could not be parsed")
+
+            logger.info(
+                "Agent decision: payment=%s action=%s rail=%s confidence=%s reason=%s",
+                context.payment_id,
+                action.action,
+                action.rail,
+                action.confidence,
+                action.reason[:80],
+            )
+            return action
+
+        except Exception as e:
+            logger.exception("LLM call failed: %s", str(e))
+            status = getattr(e, "status_code", None)
+            if status in (401, 402, 403, 404):
+                self.last_error_status = status
+                self.last_error_detail = f"HTTP {status}: {str(e)[:160]}"
+            self.fallback_count += 1
+            return self._fallback_action(context, f"LLM error: {str(e)[:160]}")
+
+    async def _call_llm(self, user_prompt: str) -> str:
+        """Call the LLM and return the raw response text."""
+        if self._provider == "anthropic":
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                # No temperature: sampling params were removed on current Claude
+                # models and return a 400. Depth is controlled by effort.
+                output_config={"effort": self._effort},
+                # The system prompt is byte-identical on every call, so cache it.
+                # Across an eval run of thousands of decisions this is the
+                # difference between full price and ~10% on the bulk of the input.
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            # Thinking is on by default; the JSON is in the text block, which is
+            # not necessarily content[0].
+            return next(
+                (b.text for b in response.content if b.type == "text"), ""
+            )
+
+        elif self._provider == "openai":
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                temperature=self._temperature,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            return response.choices[0].message.content or ""
+
+        raise ValueError(f"Unsupported provider: {self._provider}")
+
+    @staticmethod
+    def _parse_response(raw: str) -> RetryAction | None:
+        """Parse LLM response into a validated RetryAction."""
+        try:
+            # Strip markdown code fences if present
+            text = raw.strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                lines = [ln for ln in lines if not ln.strip().startswith("```")]
+                text = "\n".join(lines)
+
+            data = json.loads(text)
+            return RetryAction(**data)
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("Failed to parse LLM response: %s — raw: %s", e, raw[:200])
+            return None
+
+    @staticmethod
+    def _fallback_action(context: FailureContext, error_detail: str) -> RetryAction:
+        """Return a safe fallback action when the LLM fails."""
+        from src.classifier.taxonomy import FailureClass
+
+        try:
+            fc = FailureClass(context.failure_class)
+        except ValueError:
+            fc = FailureClass.UNKNOWN
+
+        # Use simple heuristics as fallback
+        if fc.is_hard_decline:
+            return RetryAction(
+                action="abandon",
+                reason=f"Fallback: hard decline ({error_detail})",
+                confidence=0.9,
+            )
+        elif fc == FailureClass.RISK_CHECK_FAILED:
+            # Recoverable, but not on this instrument — and the fallback has no
+            # business picking a rail blind, so it asks the customer to pick one.
+            return RetryAction(
+                action="nudge_customer",
+                reason=f"Fallback: risk check refused this instrument ({error_detail})",
+                confidence=0.4,
+            )
+        elif fc == FailureClass.NETWORK_ERROR:
+            return RetryAction(
+                action="retry_now",
+                reason=f"Fallback: network error, immediate retry ({error_detail})",
+                confidence=0.6,
+            )
+        elif fc == FailureClass.BANK_DOWNTIME:
+            from datetime import timedelta
+            return RetryAction(
+                action="retry_at",
+                retry_at=context.current_time + timedelta(minutes=30),
+                reason=f"Fallback: bank downtime, retry in 30min ({error_detail})",
+                confidence=0.5,
+            )
+        else:
+            return RetryAction(
+                action="abandon",
+                reason=f"Fallback: conservative abandon ({error_detail})",
+                confidence=0.3,
+            )

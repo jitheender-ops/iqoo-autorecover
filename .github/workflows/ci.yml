@@ -1,0 +1,173 @@
+# The CI this repo's README describes. Three gates, matching run.sh --verify-only:
+#
+#   1. verify    ruff + mypy --strict + pytest on the Python floor (3.11) and
+#                ceiling (3.13 — the interpreter development actually runs on).
+#   2. migrate   scripts/check_migrations.py proves the Alembic chain builds a
+#                schema identical to the ORM's, on empty -> head, create_all ->
+#                head (no-op) and head -> base -> head. Runs twice: on SQLite
+#                for speed, and on Postgres because two migrations passed the
+#                SQLite run and then killed the first deploy on SQL only
+#                Postgres type-checks.
+#   3. eval      trains the XGBoost baseline and runs the harness on small
+#                numbers, so the README's results table cannot quietly stop
+#                reproducing. No LLM: the fast mode needs no API keys.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: ruff + mypy + pytest (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff
+        run: ruff check .
+
+      - name: mypy --strict
+        run: mypy src scripts eval
+
+      - name: pytest
+        run: pytest -q
+
+  migrations:
+    name: alembic chain vs ORM schema
+    runs-on: ubuntu-latest
+    services:
+      # The dialect that deploys. Postgres rejects things SQLite stores
+      # happily — a JSONB server_default SQLAlchemy quoted into '''[]''', a
+      # text literal assigned to a jsonb column — and both shipped, because
+      # the only chain check ran on SQLite.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Migration chain check (SQLite)
+        run: python scripts/check_migrations.py
+
+      - name: Migration chain check (Postgres)
+        # Scratch databases are created beside `postgres` and dropped; the
+        # named database is only ever the admin handle.
+        run: >
+          python scripts/check_migrations.py
+          --postgres postgresql://postgres:postgres@localhost:5432/postgres
+
+  eval:
+    name: train model + eval harness reproduces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Train XGBoost baseline
+        # 5000 keeps the scarce retry_now class populated (~6 examples); below
+        # that xgboost cannot build its label space. Trains in seconds.
+        run: python scripts/train_xgboost.py --n-samples 5000
+
+      - name: Eval harness (fast mode)
+        run: python -m eval.runner --scenarios 500 --seeds 1 --skip-llm
+
+      - name: Calibration guard
+        run: pytest -q tests/test_calibration.py
+
+  semgrep:
+    name: semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install semgrep
+      # Inline nosemgrep suppressions carry written rationale; --error makes
+      # any unsuppressed finding fail the build.
+      #
+      # django-no-csrf-token is excluded at the RULE level, not per form: this
+      # is FastAPI + Jinja2 and there is no Django in the dependency tree, so
+      # the rule cannot ever be right here — it matches any `<form
+      # method="post">` in a .html file and asks for a `{% csrf_token %}` tag
+      # that does not exist outside Django. Suppressing it per form would mean
+      # re-arguing it on every form ever added.
+      #
+      # The underlying concern is separately handled: the console session
+      # cookie is httponly + samesite=lax + secure (src/merchant/routes.py), so
+      # a cross-site POST carries no session, and the customer forms
+      # authenticate by the signed token in their own URL rather than a cookie
+      # — nothing there is ambient authority for a CSRF to ride.
+      - run: >
+          semgrep scan --config p/default --metrics=off --error
+          --exclude-rule python.django.security.django-no-csrf-token.django-no-csrf-token
+          src scripts eval dashboard
+
+  pip-audit:
+    # Known CVEs in the dependency tree, on every push and PR. Semgrep and
+    # gitleaks audit the code and the history; this audits the building
+    # blocks. `--desc off` because a description network call made the step
+    # flaky in CI for findings that block anyway.
+    name: pip-audit (dependency CVEs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Audit dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit --skip-editable --desc off
+
+  secrets:
+    name: gitleaks (secret scan, full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history — a secret buried in an old commit counts
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

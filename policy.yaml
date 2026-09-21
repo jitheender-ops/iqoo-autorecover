@@ -1,0 +1,239 @@
+# Recovery engine policy — read this, not the code.
+#
+# This file is documentation, not configuration: every value here is a mirror
+# of a real threshold enforced in code (src/guardrail/rules.py, src/config.py,
+# src/chasers/policy.py). It exists so a reviewer can see every rule the
+# engine runs under without reading Python. If this file and the code ever
+# disagree, the code wins — file an issue, don't trust this page.
+#
+# The rules below run in src/guardrail/gate.py, AFTER the policy agent (LLM or
+# XGBoost) proposes an action and BEFORE anything touches money or a
+# customer's phone. No model is in this loop. Rejected actions never execute;
+# they are recorded (RetryAttempt.result = "rejected") with the specific
+# clause that blocked them, and both counts surface on the merchant console.
+
+version: 1
+last_verified_against_code: "2026-08-30"
+
+# ── Global guardrail thresholds (src/config.py, env-configurable) ──────────
+global:
+  max_retries_per_payment: 3
+  max_retries_per_customer_24h: 5
+  max_nudges_per_customer_24h: 2
+  amount_ceiling_paise: 5000000       # ₹50,000 — retries above this need explicit consent, not automation
+  consent_window_hours: 72            # default; chaser risk types override per type below
+  retry_blackout_ist: "23:00-07:00"   # no retries fire in this window; bank success rates fall off a cliff
+  retry_attempt_cost_inr: 2           # priced into the expected-value stopping rule below
+  retry_annoyance_cost_inr: 0         # off by default — a real number is a product call, not ours
+
+# ── Hard rules (always on, no threshold to tune) ────────────────────────────
+hard_rules:
+  - id: hard_decline_blocklist
+    rule: "Fraud blocks and true hard declines are never retried. Full stop."
+  - id: switch_only_classes
+    rule: >
+      A failure class marked switch-only is recoverable, but never on the rail
+      that just failed. retry_now and retry_at are refused for it; switch_rail
+      and nudge_customer are the only ways to spend an attempt. Currently
+      risk_check_failed (Razorpay documents payment_risk_check_failed retryable
+      and advises "a different card or method" — a rail switch, not a retry).
+      Not applied to a customer's own attempt from the recovery page: choosing
+      a different instrument there is exactly the advice.
+    enforced_in: "src/guardrail/rules.py:check_switch_only_class"
+  - id: idempotency_key_required
+    rule: "Every retry attempt must carry an idempotency key. Missing = refused, never defaulted."
+  - id: retry_at_within_consent_window
+    rule: "A deferred retry scheduled past the consent deadline is rejected outright, not silently retimed."
+  - id: expected_value
+    rule: >
+      Attempt only while confidence * amount > retry_cost + annoyance_cost.
+      Applies to retry_now and switch_rail — the two actions that spend an
+      actual attempt — and ONLY when the agent supplied a confidence score;
+      an agent giving no estimate is not asserting a false one, so this rule
+      stays silent rather than inventing a number to reject on. Additive
+      alongside every fixed cap above, never a replacement for one.
+    enforced_in: "src/guardrail/rules.py:check_expected_value"
+  - id: mandate_predebit_notification   # RBI Digital Payments E-mandate Framework, 2026
+    rule: >
+      A debit presented against a mandate is blocked unless a notification to
+      the customer was confirmed sent at least 24 hours before it — and no
+      more than 7 days before it
+      (MANDATE_PREDEBIT_NOTIFICATION_VALID_HOURS): the framework's notice is
+      per-debit, so a stale notification is treated as unsent and must be
+      re-sent. Applies to risk_type=mandate_failure with action=retry_now,
+      and to the promise-backed UPI Autopay debit on ANY risk type — the two
+      things in this engine that move money against a standing instruction.
+      The 48h pre-due promise reminder IS that notice for the second.
+      Post-debit: a successful mandate capture logs a confirmation event.
+      Opt-out is honoured immediately across every risk type, not just this one.
+    source: "RBI Digital Payments E-mandate Framework, 2026 — 24h pre-debit notice, post-debit confirmation, opt-out in the pre-debit notice."
+    enforced_in: "src/guardrail/rules.py:check_mandate_predebit_notification"
+
+# ── Per-risk-type chase policy (src/chasers/policy.py — code change required to move these) ──
+chasers:
+  checkout_abandonment:
+    max_attempts: 2
+    consent_window_hours: 48
+    first_action_hours: 1.0
+    re_chase_hours: 24.0
+    note: "No payment was ever attempted. One reminder, one follow-up. A third is spam."
+  subscription_failure:
+    max_attempts: 4
+    consent_window_hours: 168   # 7 days, a typical renewal grace period
+    first_action_hours: 0.0
+    re_chase_hours: 24.0
+    note: "Structurally a payment failure. First touch goes out immediately."
+  invoice_overdue:
+    max_attempts: 4
+    consent_window_hours: 720   # 30 days
+    first_action_hours: 0.0
+    re_chase_hours: 72.0
+    note: "B2B receivable. Slow ladder, long window, four contacts is where dunning research puts diminishing returns."
+  mandate_failure:
+    max_attempts: 3
+    consent_window_hours: 168   # 7 days
+    first_action_hours: 24.0
+    re_chase_hours: 48.0
+    note: "A merchant-reported mandate failure carries no token we hold, so every action here mints a payment link like the other chasers; the engine only debits a mandate a customer authorised against their own promise to pay."
+  payment_failure:
+    note: >
+      Webhook-driven, not a chaser — every payment.failed event re-triggers
+      the pipeline directly. Its bounds are the global thresholds above, not
+      a per-type entry here.
+
+# ── What the engine will never do, regardless of any threshold above ───────
+never:
+  - "Let the LLM call the Razorpay API directly. It proposes a structured action; only the deterministic executor, after the guardrail passes it, moves money."
+  - "Retry a fraud-blocked or hard-declined payment, at any attempt count."
+  - "Contact a customer who has opted out, on any risk type, until they opt back in."
+  - "Report a recovered-money number that isn't a real payment the engine's own link (or the customer's own payment) actually settled."
+
+# ── Where the LLM is allowed near diagnosis, and how narrowly ──────────────
+diagnosis:
+  default: >
+    Deterministic lookup (src/classifier/mapper.py) against Razorpay's error
+    fields. Handles every failure the rule table has a match for — no LLM,
+    no exceptions.
+  ambiguous_tail:
+    enabled_by_default: false
+    setting: CLASSIFIER_LLM_TAIL_ENABLED
+    rule: >
+      Consulted ONLY when the deterministic mapper already returned UNKNOWN
+      (no rule matched) AND the flag is on. Constrained to the same
+      FailureClass enum, JSON-only output, never freeform. Never
+      second-guesses a confident deterministic match. Any LLM error, timeout
+      or unparseable reply falls back to UNKNOWN — this can only ever turn
+      an "I don't know" into a specific answer, never overwrite one.
+    enforced_in: "src/classifier/llm_tail.py:classify_tail"
+    wired_into_the_live_pipeline: false
+    note: >
+      Built and tested, opt-in by design. Not called from
+      orchestrator.py's ingestion path by default — turning this on for
+      live traffic is a deliberate call the project should make explicitly,
+      not something that changes by editing this file alone.
+
+# ── Where the numbers this file promises are actually verified ─────────────
+verification:
+  tests: >
+    pytest — 430+ tests, including guardrail rules and their rejections
+    (tests/test_guardrail.py, tests/test_guardrail_properties.py,
+    tests/test_audit_fixes.py), the audit hash chain and its tamper case
+    (tests/test_audit_chain.py), and the LLM tail classifier's fallback
+    behaviour (tests/test_classifier_llm_tail.py)
+  ci: ".github/workflows — ruff + mypy --strict + pytest on 3.11 and 3.13, migration-chain check, eval reproduction"
+  scoreboard: "merchant console (/console/live) reports actions_blocked and compliance_blocks counts, sourced from RetryAttempt.result='rejected' rows — not a slide, a live query"
+  audit_chain: "python scripts/audit_chain.py --stamp / --verify — recomputes the whole case_events chain from raw rows, trusts nothing stored"
+
+# ── Voice recovery agent (Hinglish) — the sixth chaser's rules ──────────────
+# Built (src/voice/), provider-agnostic, grounded; no phone calls are made by
+# the engine — telephony providers POST transcripts to /voice/turn and read
+# the JSON reply back through their own TTS. Voice inherits every never-rule
+# above, plus its own:
+voice:
+  language: "Hinglish — code-mixed Hindi + English, Roman and Devanagari"
+  auth: "HMAC over the raw body, X-Voice-Signature, VOICE_WEBHOOK_SECRET; empty secret = endpoint closed"
+  opt_out: "Recognised in either language before any other gate; closes every open case via cases.record_opt_out — never a counter-offer"
+  chaser_integration: >
+    VOICE_CHASER_ENABLED (default off) makes the orchestrator queue a voice
+    follow-up call after a successful nudge_customer touch — same
+    transaction as the attempt outcome (write-ahead), one queue row per
+    attempt. The telephony leg claims rows atomically via
+    POST /voice/queue/claim (UPDATE...RETURNING, one winner per row) and
+    reports outcomes to /voice/queue/report; a reported spoken opt-out
+    closes the customer's cases through the same record_opt_out path as
+    every other channel.
+  prompt_injection: "Instruction-shaped transcript content is refused by lexicon before retrieval or generation (gate 1)"
+  grounding: "Every answer is verified against its retrieved passages and case facts; a number absent from the passages is an abstention, regardless of fluency (gate 4, numeric half)"
+  answer_paths: >
+    Extractive by default (replies assembled verbatim from passages + facts,
+    zero dependencies). VOICE_LLM_ENABLED=on opts into an LLM rephrase of
+    the same passages — JSON-constrained, and the numeric grounding gate
+    still applies.
+  corpus: "policy.yaml bounds mirrored from src/chasers/policy.py at import, FailureClass taxonomy, hand-authored Hinglish FAQ; hashed bag-of-words retriever (offline-first), e5 upgrade swaps embed() only"
+  deployment_obligation: >
+    Commercial voice calls in India need the merchant's own telephony
+    registration (DoT/TCPB for the number and route; a disclosed caller ID),
+    and AI-disclosure at call start in the provider's greeting. The engine's
+    templates never claim a human is speaking.
+
+# ── Regulatory posture — what the code enforces vs what the deployer owes ───
+# Honest line: software cannot make a merchant compliant. This section
+# records which obligations are enforced in code (and where), and which are
+# deployment obligations the merchant must own. The lists exist so nobody
+# mistakes the engine's guardrails for the whole of the law.
+compliance:
+  enforced_in_code:
+    - rule: >
+        RBI Digital Payments E-mandate Framework (Master Direction on
+        Digital Payment Security Measures): pre-debit notification at least
+        24h before a mandate re-presentation, treated as per-debit — a
+        notification older than 7 days (MANDATE_PREDEBIT_NOTIFICATION_VALID_HOURS)
+        is stale and must be re-sent before retry_now is allowed.
+      enforced_in: "src/guardrail/rules.py:check_mandate_predebit_notification"
+      post_debit: "src/cases.py:mandate_post_debit_confirmation event on every mandate capture"
+    - rule: >
+        Quiet hours: no chase attempt inside 23:00–07:00 IST — deferred,
+        not burned (configurable RETRY_BLACKOUT_* settings).
+      enforced_in: "src/guardrail/rules.py:check_time_of_day_blackout"
+    - rule: >
+        Contact-frequency cap: max_retries_per_customer_24h bounds all
+        outreach per customer per day; opt-out closes every open case and
+        stops all future outreach for that customer.
+      enforced_in: "src/guardrail/gate.py, src/cases.py:record_opt_out"
+    - rule: >
+        DPDP Act, 2023 data-minimization posture: the merchant console
+        surfaces aggregates and the merchant's own references only — never
+        a customer email, phone or id; recovery links are PII-free tokens
+        (no email/phone/amount in the URL); customer contact data is used
+        solely to perform the recovery the merchant directs.
+      enforced_in: "src/merchant/routes.py (aggregate SQL), src/recovery_link.py"
+    - rule: >
+        Tamper-evident audit trail: every case action is recorded in a
+        hash-chained, append-only event log keyed by AUDIT_CHAIN_SECRET —
+        re-stamping a rewritten chain is impossible without the key, which
+        lives outside the database.
+      enforced_in: "src/audit_chain.py, scripts/audit_chain.py"
+  deployment_obligations:
+    - >
+      TRAI DLT registration: transactional SMS in India must be sent
+      through a DLT-registered template on a DLT-registered route, with a
+      registered Sender ID. The engine generates message content and the
+      merchant's SMS gateway sends it — template registration is the
+      deployer's duty before live traffic.
+    - >
+      Razorpay account must be live-mode (not test) with the recovery
+      webhook configured for the deployment's public URL; test mode does
+      not support UPI payment links.
+    - >
+      DPDP Act, 2023: as a Data Fiduciary for the customer data flowing
+      through recovery, the deploying merchant needs their own lawful basis
+      and consent records for recovery outreach, breach-response process,
+      and grievance-redressal contact. The engine's opt-out and
+      PII-minimization support this but do not substitute for it.
+    - >
+      SMS content must carry the merchant's identity and, for any charge
+      presented, an honest description; the engine enforces this in its
+      copy but the merchant's own templates must match.
+  note: >
+    This list is a posture statement, not legal advice. Verify against the
+    current RBI Master Direction text and TRAI DLT rules before production.

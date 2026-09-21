@@ -1,0 +1,1926 @@
+"""
+The merchant's view of the recovery engine.
+
+Everything else in this product is machinery the merchant never sees: the
+webhook receiver, the agent, the guardrail, the ops console. This module is the
+one surface built for the person who NEEDS the architecture, the merchant whose
+revenue is leaking through failed charges, cold carts, overdue invoices and dead
+mandates.
+
+Two pages, two trust levels:
+
+* ``GET /console`` — PUBLIC landing. What the engine recovers, the five chasers
+  and the payment rail it wraps, what it does once the customer answers, how
+  the architecture stays safe, and how to feed it (``POST /risks``). It renders
+  product facts only (chase bounds come straight from ``src/chasers/policy.py``,
+  escalation rungs from ``src/receivables/ladder.py``); it never touches the
+  database and never shows a live number, so it is safe to serve to anyone on a
+  public deployment.
+
+* ``GET /console/live`` — the GATED console. Recovered rupees, recovery rate,
+  per-chaser activity and the most recent recoveries, read live from the
+  database. It is aggregate and PII-free: totals, counts and merchant-chosen
+  references, never a customer email, phone or id.
+
+Gating follows the codebase's fail-closed discipline. The live console is
+protected by the same ``DASHBOARD_PASSWORD`` that gates the Streamlit ops
+console (this is a single-tenant deployment: the merchant runs their own
+instance, so the operator's password is the merchant's password). A signed,
+expiring session cookie proves the password was entered; the signing reuses the
+stdlib HMAC pattern from ``src/recovery_link.py`` rather than adding a
+dependency. With ``DASHBOARD_PASSWORD`` unset the console refuses to open,
+exactly like the ops console.
+"""
+
+from __future__ import annotations
+
+import functools
+import hmac
+import json
+import logging
+import time
+import uuid
+from collections import deque
+from pathlib import Path
+from typing import Any, get_args
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import func, select
+
+from src.agent.actions import ActionType
+from src.auth import client_ip
+from src.chasers.policy import RISK_POLICIES
+from src.classifier.taxonomy import FailureClass
+from src.config import get_settings, reveal
+from src.database import async_session_factory
+from src.formatting import ist as _ist
+from src.formatting import money as _money
+from src.guardrail.rules import GuardrailRules
+from src.merchant import console_data
+from src.models import RecoveryCase, RetryAttempt
+from src.receivables.ladder import INVOICE_LADDER
+from src.receivables.models import MerchantAlert
+from src.recovery_link import SEP, b64, sign, unb64
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+# ── Presentation helpers ────────────────────────────────────────────────────
+def _window_label(hours: int) -> str:
+    """A consent window a person can read: '7 days', not '168 hours'."""
+    if hours % 24 == 0:
+        days = hours // 24
+        return f"{days} day" if days == 1 else f"{days} days"
+    return f"{hours} hour" if hours == 1 else f"{hours} hours"
+
+
+# ── Chaser product facts (for the public landing) ───────────────────────────
+# Display copy for each recovery type, in display order (dicts keep insertion
+# order). The numeric bounds are NOT written here: they are read from
+# src/chasers/policy.py (and src/config.py for the payment rail) at render
+# time, so the landing can never drift from the promises the engine actually
+# enforces.
+_CHASER_COPY: dict[str, dict[str, str]] = {
+    "payment_failure": {
+        "label": "Failed payment",
+        "icon": "card",
+        "blurb": (
+            "A card or UPI charge declined at the gateway. The engine reads the "
+            "decline, moves to the rail most likely to clear, and retries inside "
+            "the consent window."
+        ),
+    },
+    "checkout_abandonment": {
+        "label": "Abandoned checkout",
+        "icon": "cart",
+        "blurb": (
+            "A cart went cold before any payment was attempted. One gentle "
+            "reminder with a link to finish, then one follow-up. Two touches, "
+            "never a third."
+        ),
+    },
+    "subscription_failure": {
+        "label": "Failed subscription charge",
+        "icon": "repeat",
+        "blurb": (
+            "A renewal did not go through, but the customer believes they are "
+            "still subscribed. Reached before the grace period ends, on UPI to "
+            "skip the OTP step."
+        ),
+    },
+    "invoice_overdue": {
+        "label": "Overdue invoice",
+        "icon": "invoice",
+        "blurb": (
+            "A B2B invoice is past due. A slow ladder of four touches over thirty "
+            "days, built around the customer's promise to pay."
+        ),
+    },
+    "mandate_failure": {
+        "label": "Failed autopay debit",
+        "icon": "calendar",
+        "blurb": (
+            "A pre-approved mandate debit bounced. The mandate is standing consent "
+            "to collect, so the charge is presented again, after a day for funds "
+            "or the bank to recover."
+        ),
+    },
+}
+
+
+def _ladder_rungs() -> list[dict[str, Any]]:
+    """The B2B escalation rungs, for the landing's 'after the link' section.
+
+    Read from INVOICE_LADDER for the same reason the chaser bounds are read
+    from RISK_POLICIES: the page states what the engine enforces, so it must
+    read the enforcing structure rather than restate it.
+    """
+    return [
+        {
+            "tone": stage.tone,
+            "days": stage.days_past_due,
+            "addresses": _ROLE_LABELS[stage.addresses[-1]],
+        }
+        for stage in INVOICE_LADDER
+    ]
+
+
+# Contact roles as a merchant would name them, not as the schema stores them.
+_ROLE_LABELS = {
+    "ap_clerk": "accounts payable",
+    "finance_manager": "the finance manager",
+    "escalation": "their escalation contact",
+}
+
+
+def _chaser_cards() -> list[dict[str, Any]]:
+    """The five recovery types with their enforced bounds, for the landing."""
+    settings = get_settings()
+    cards: list[dict[str, Any]] = []
+    for risk_type, copy in _CHASER_COPY.items():
+        policy = RISK_POLICIES.get(risk_type)
+        if policy is not None:
+            max_attempts = policy.max_attempts
+            window = _window_label(policy.consent_window_hours)
+            rail = "UPI-first" if policy.recommended_rail == "upi" else "Best rail"
+            source = "Merchant event"
+        else:
+            # The payment rail: webhook-driven, bounds live in config.
+            max_attempts = settings.max_retries_per_payment
+            window = _window_label(settings.consent_window_hours)
+            rail = "Switches rail"
+            source = "Razorpay webhook"
+        cards.append(
+            {
+                "risk_type": risk_type,
+                "label": copy["label"],
+                "icon": copy["icon"],
+                "blurb": copy["blurb"],
+                "max_attempts": max_attempts,
+                "window": window,
+                "rail": rail,
+                "source": source,
+            }
+        )
+    return cards
+
+
+# ── The model page (/model) ─────────────────────────────────────────────────
+# A page about the decision layer rather than the product: what classifies a
+# failure, what may be decided about it, what re-checks the decision, and what
+# the harness measures. Everything below reads the enforcing structure —
+# the taxonomy enum, the action Literal, the rule methods, the eval's own
+# result file — for the same reason the landing reads RISK_POLICIES: a page
+# that restates the engine in prose drifts from it silently, and this one is
+# entirely claims.
+
+_EVAL_RESULTS = Path(__file__).resolve().parents[2] / "eval" / "results" / "eval_results.json"
+
+# Failure classes as a merchant would name them: a display title and a plain
+# blurb. The MEMBERSHIP of each lever group is read from the taxonomy, never
+# listed here — only the wording is. Titles are spelled out rather than shown
+# as snake_case identifiers: `insufficient_funds` is the enum's business, and
+# a reader of this page is being told what failed, not what it is called in
+# Python. The raw identifier still appears where the string genuinely IS the
+# data — the webhook body, the YAML lookup, the case record.
+_CLASS_LABELS: dict[str, tuple[str, str]] = {
+    "insufficient_funds": ("Insufficient funds", "not enough money, right then"),
+    "bank_downtime": ("Bank downtime", "the bank was down"),
+    "network_error": ("Network error", "the network dropped mid-charge"),
+    "upi_collect_timeout": ("UPI collect timeout", "the collect request expired unanswered"),
+    "payment_timeout": ("Payment timeout", "the payment never came back"),
+    "3ds_dropoff": ("3DS drop-off", "the customer abandoned the OTP screen"),
+    "issuer_decline": ("Issuer decline", "the issuer said no, without saying why"),
+    "card_limit_exceeded": ("Card limit exceeded", "over the card's limit"),
+    "risk_check_failed": ("Risk check failed", "a risk screen stopped the instrument"),
+    "invalid_card": ("Invalid card", "the card details are wrong"),
+    "expired_instrument": ("Expired instrument", "the card has expired"),
+    "fraud_block": ("Fraud block", "flagged as fraud"),
+    "hard_decline": ("Hard decline", "a permanent decline"),
+    "customer_cancelled": ("Customer cancelled", "the customer cancelled"),
+    "unknown": ("Unknown", "an error code nothing maps"),
+}
+
+
+# What each of the five actions actually does, for the action-space act.
+_ACTION_COPY: dict[str, tuple[str, str]] = {
+    "retry_now": (
+        "Retry now",
+        "Re-present the charge immediately, same rail. Only where the blocker "
+        "plausibly cleared on its own.",
+    ),
+    "retry_at": (
+        "Retry at",
+        "Park the retry for a named time. The guardrail clamps it out of the "
+        "blackout and refuses one landing past the consent window.",
+    ),
+    "switch_rail": (
+        "Switch rail",
+        "Move to UPI, card, netbanking or wallet — the only lever for a class "
+        "that will decline again on the instrument that just failed.",
+    ),
+    "nudge_customer": (
+        "Nudge customer",
+        "Send a signed, expiring link and let the customer choose. What moves "
+        "insufficient funds; nothing else does.",
+    ),
+    "abandon": (
+        "Abandon",
+        "Stop. A hard decline is not a recovery problem, and chasing one "
+        "spends a contact to earn a second refusal.",
+    ),
+}
+
+# The rule NAMES come from GuardrailRules; only the wording lives here. A rule
+# added to the class shows up on this page with its own method name until
+# somebody writes it a label — visible, rather than silently missing.
+_RULE_LABELS: dict[str, str] = {
+    "check_hard_decline_blocklist": "The class is not a hard decline",
+    "check_switch_only_class": "A switch-only class is not being retried in place",
+    "check_max_retries_per_payment": "The case has attempts left",
+    "check_max_retries_per_customer": "The customer is not over their 24h budget",
+    "check_amount_ceiling": "The amount is under the ceiling",
+    "check_consent_window": "The consent window is still open",
+    "check_retry_at_within_window": "A deferred retry lands inside that window",
+    "check_time_of_day_blackout": "It is not 23:00–07:00 IST",
+    "check_idempotency_key": "The idempotency key is present and unspent",
+    "check_expected_value": "The attempt is worth more than it costs",
+    "check_mandate_predebit_notification": "An RBI pre-debit notice was sent in time",
+    "check_customer_nudge_rate_limit": "The customer is not over their nudge cap",
+}
+
+
+def _failure_classes() -> list[dict[str, Any]]:
+    """The taxonomy, grouped by the lever that moves each class.
+
+    Group membership is computed from the taxonomy's own properties, so a class
+    that changes lever changes column here without anyone editing this file.
+    """
+    out: list[dict[str, Any]] = []
+    for fc in FailureClass:
+        if fc.is_hard_decline:
+            lever, lever_label = "abandon", "Abandon"
+        elif fc.is_switch_only:
+            lever, lever_label = "switch", "Switch rail only"
+        elif fc.is_retryable:
+            lever, lever_label = "retry", "Retryable"
+        else:
+            lever, lever_label = "unmapped", "Not retryable"
+        # A class with no wording yet still renders, under its own name with
+        # the underscores opened up — visible rather than silently missing.
+        title, blurb = _CLASS_LABELS.get(
+            fc.value, (fc.value.replace("_", " ").capitalize(), "")
+        )
+        out.append(
+            {
+                "name": fc.value,
+                "title": title,
+                "blurb": blurb,
+                "lever": lever,
+                "lever_label": lever_label,
+            }
+        )
+    return out
+
+
+def _action_space() -> list[dict[str, str]]:
+    """The five actions the agent may emit, read from the ActionType Literal."""
+    out: list[dict[str, str]] = []
+    for name in get_args(ActionType):
+        title, blurb = _ACTION_COPY.get(name, (name, ""))
+        out.append({"name": name, "title": title, "blurb": blurb})
+    return out
+
+
+def _gate_rules() -> list[dict[str, str]]:
+    """Every business rule on GuardrailRules, in declaration order."""
+    return [
+        {"name": name, "label": _RULE_LABELS.get(name, name.replace("_", " "))}
+        for name in vars(GuardrailRules)
+        if name.startswith("check_")
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _eval_headline() -> dict[str, Any] | None:
+    """The four measured figures, read from the eval's own result file.
+
+    Returns None — and the page then omits the whole act — if the file is
+    missing or does not carry what it needs. A results page that invents a
+    fallback number is worse than one that says nothing, and this is the only
+    part of the page not derivable from the source tree.
+    """
+    try:
+        raw = json.loads(_EVAL_RESULTS.read_text())
+        paired = raw["paired_vs_baseline"]["XGBoost"]["recovery_rate_pp"]
+        econ = raw["economics_vs_baseline"]["XGBoost"]
+        baseline = raw["policies"]["Fixed 3-Retry"]
+        winner = raw["policies"]["XGBoost"]
+        return {
+            "mix": raw.get("mix", "legacy"),
+            "recovery_pp": paired["mean_delta"],
+            "ci_low": paired["ci95"][0],
+            "ci_high": paired["ci95"][1],
+            "n_paired": paired["n_paired"],
+            "revenue_delta": econ["delta_revenue_per_crore"],
+            "attempts_delta": econ["delta_attempts_per_crore"],
+            "verdict": econ["verdict"],
+            "false_retry_from": baseline["false_retry_rate_%"],
+            "false_retry_to": winner["false_retry_rate_%"],
+        }
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        logger.info("No usable eval results at %s — /model omits the results act", _EVAL_RESULTS)
+        return None
+
+
+# ── Session cookie (signed, expiring) ───────────────────────────────────────
+# Same stdlib HMAC construction as src/recovery_link.py (the primitives are
+# imported from there): base64(payload).sign. Keyed by DASHBOARD_PASSWORD, so
+# a session is proof the password was entered, and rotating the password
+# invalidates every open session. No new dependency.
+_SESSION_COOKIE = "rc_session"
+_SESSION_TTL_SECONDS = 12 * 3600
+
+
+def _console_password() -> str:
+    return reveal(get_settings().dashboard_password)
+
+
+def _password_configured() -> bool:
+    return bool(_console_password())
+
+
+def _cookie_secure() -> bool:
+    """
+    Whether the console's cookies carry the Secure attribute.
+
+    Development is exempt: the app is on localhost (plain http) and the demo
+    tunnel, where a Secure cookie would silently never be stored and the
+    console would look logged-out for no visible reason. Everywhere else —
+    staging AND production — the surface is deployed and serving real money
+    figures behind a TLS-terminating proxy, so the session cookie and the
+    preview marker must never be accepted over a plaintext leg. Keying off
+    ``!= "development"`` rather than ``== "production"`` is the point:
+    staging is a real deployment with real data, and render.yaml deploys it.
+    """
+    return get_settings().app_env != "development"
+
+
+def _mint_session() -> str:
+    # Only called once the password is configured and matched, so the signing
+    # key is never empty here.
+    payload = f"console{SEP}{int(time.time()) + _SESSION_TTL_SECONDS}"
+    return f"{b64(payload.encode())}{SEP}{sign(payload, _console_password())}"
+
+
+def _session_valid(request: Request) -> bool:
+    """True only for an unexpired, correctly-signed session cookie."""
+    secret = _console_password()
+    token = request.cookies.get(_SESSION_COOKIE)
+    if not secret or not token or token.count(SEP) != 1:
+        return False
+    encoded, signature = token.split(SEP)
+    try:
+        payload = unb64(encoded).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not hmac.compare_digest(
+        sign(payload, secret).encode("ascii"), signature.encode("utf-8", "replace")
+    ):
+        return False
+    if payload.count(SEP) != 1:
+        return False
+    _, _, expiry = payload.partition(SEP)
+    try:
+        return int(expiry) >= int(time.time())
+    except ValueError:
+        return False
+
+
+# ── Login throttling ────────────────────────────────────────────────────────
+# A single shared static password with unlimited guesses falls to a script, so
+# guesses are budgeted per client IP: six a minute, then the door closes for
+# five. Mirrors dashboard/auth.py's lockout, adapted to per-IP buckets because
+# FastAPI has a real client identity and Streamlit did not.
+_LOGIN_WINDOW_SECONDS = 60.0
+_LOGIN_MAX_FAILURES = 6
+_LOGIN_LOCKOUT_SECONDS = 300.0
+_LOGIN_FAILURES: dict[str, deque[float]] = {}
+_LOGIN_LOCKED_UNTIL: dict[str, float] = {}
+# Distinct IPs must not grow these maps without bound. Entries are removed on
+# a successful login, but a distributed guesser (or a slow drip across many
+# addresses) never logs in, so without a sweep the failure history is a
+# per-IP memory leak on a public endpoint. Same bounded-GC discipline as
+# src/rate_limit.py: sweep only once the maps pass a threshold, and only the
+# dead entries — ones that can never affect a future decision.
+_LOGIN_GC_AT = 10_000
+
+
+def _login_locked_seconds(ip: str) -> int:
+    return max(0, int(_LOGIN_LOCKED_UNTIL.get(ip, 0.0) - time.monotonic()))
+
+
+def _gc_login_state() -> None:
+    """
+    Drop dead entries from the login-throttle maps past _LOGIN_GC_AT.
+
+    Dead = a bucket whose window has rolled off (empty or older than the
+    window) and a lock that has already expired. Neither can affect a future
+    decision — a cleared bucket starts fresh, an expired lock lets the next
+    attempt through — so removing them changes no behaviour, it only stops
+    the maps from being the thing that fills. Live locks and fresh buckets
+    are untouched. Runs on the failure-write path, where the maps grow.
+    """
+    now = time.monotonic()
+    if len(_LOGIN_FAILURES) + len(_LOGIN_LOCKED_UNTIL) < _LOGIN_GC_AT:
+        return
+    stale_failures = [
+        ip for ip, bucket in _LOGIN_FAILURES.items()
+        if not bucket or now - bucket[-1] > _LOGIN_WINDOW_SECONDS
+    ]
+    for ip in stale_failures:
+        del _LOGIN_FAILURES[ip]
+    stale_locks = [
+        ip for ip, until in _LOGIN_LOCKED_UNTIL.items() if until <= now
+    ]
+    for ip in stale_locks:
+        del _LOGIN_LOCKED_UNTIL[ip]
+
+
+def _record_login_failure(ip: str) -> None:
+    _gc_login_state()
+    now = time.monotonic()
+    bucket = _LOGIN_FAILURES.setdefault(ip, deque())
+    while bucket and now - bucket[0] > _LOGIN_WINDOW_SECONDS:
+        bucket.popleft()
+    bucket.append(now)
+    if len(bucket) >= _LOGIN_MAX_FAILURES:
+        _LOGIN_LOCKED_UNTIL[ip] = now + _LOGIN_LOCKOUT_SECONDS
+        bucket.clear()
+
+
+# ── Live console data (aggregate, PII-free) ─────────────────────────────────
+# One read-only session opened and closed here, not the get_session dependency:
+# these are pure reads, and a console that cannot reach the database must
+# degrade to an honest "not connected" state rather than a 500.
+#
+# ORM CONSTRUCTS, NOT text() STRINGS. These were hand-written SQL, and the
+# three bugs that produced are all the same bug: a string is not checked
+# against the schema, not translated per dialect, and not type-coerced on the
+# way back.
+#
+#   * `WHERE delivered = 0` on a Boolean column — SQLite says 0/1, Postgres
+#     refuses `boolean = integer`. The alerts feed was empty in production.
+#   * `avg(... max(x) ...)` in the aging module — a nested aggregate no
+#     dialect accepts. It never returned a number anywhere.
+#   * `SELECT ... recovered_at` through text() comes back a STRING on SQLite,
+#     because a raw string carries no column type for SQLAlchemy to coerce
+#     against — so date formatting blew up on the test dialect only.
+#
+# Written as select(Model.col), each of those is either impossible or caught
+# by mypy. The FILTER clauses below render as FILTER on Postgres and a CASE on
+# SQLite; SQLAlchemy owns that difference so this module does not have to.
+_OVERVIEW = select(
+    func.count(RecoveryCase.id),
+    func.count(RecoveryCase.id).filter(RecoveryCase.state == "recovered"),
+    func.coalesce(func.sum(RecoveryCase.amount_at_risk), 0),
+    func.coalesce(func.sum(RecoveryCase.amount_recovered), 0),
+    func.coalesce(
+        func.sum(RecoveryCase.amount_recovered).filter(
+            RecoveryCase.recovered_via_attempt_id.is_not(None)
+        ),
+        0,
+    ),
+)
+
+_CHASERS = (
+    select(
+        RecoveryCase.risk_type,
+        func.count(RecoveryCase.id),
+        func.count(RecoveryCase.id).filter(RecoveryCase.state == "recovered"),
+        func.coalesce(func.sum(RecoveryCase.amount_at_risk), 0),
+        func.coalesce(func.sum(RecoveryCase.amount_recovered), 0),
+        func.coalesce(
+            func.sum(RecoveryCase.amount_recovered).filter(
+                RecoveryCase.recovered_via_attempt_id.is_not(None)
+            ),
+            0,
+        ),
+    )
+    .group_by(RecoveryCase.risk_type)
+    .order_by(RecoveryCase.risk_type)
+)
+
+# Recent recoveries show the merchant's own reference and the amount, never the
+# customer's identity: this page is aggregate by design.
+_RECENT = (
+    select(
+        RecoveryCase.risk_type,
+        RecoveryCase.subject_ref,
+        RecoveryCase.amount_recovered,
+        RecoveryCase.recovered_at,
+    )
+    .where(RecoveryCase.state == "recovered", RecoveryCase.recovered_at.is_not(None))
+    .order_by(RecoveryCase.recovered_at.desc())
+    .limit(8)
+)
+
+# "Blocked" is every guardrail rejection (budget, blackout, amount ceiling,
+# ...). "Compliance blocks" is the subset citing a specific regulatory clause
+# (currently just the RBI e-mandate rule) — a narrower, stronger claim than
+# "blocked", so it is counted separately rather than inferred from the
+# total. Named "blocks", not "violations": these are attempts the engine
+# PREVENTED before execution — a violation that reached a customer would be a
+# bug, and a counter that could read as "N violations happened" inverts what
+# the number proves. Both read straight off RetryAttempt, no new table.
+_GUARDRAIL = select(
+    func.count(RetryAttempt.id).filter(RetryAttempt.result == "rejected"),
+    func.count(RetryAttempt.id).filter(
+        RetryAttempt.result == "rejected",
+        RetryAttempt.guardrail_rejection_reason.like("%RBI%"),
+    ),
+)
+
+# Cases the engine has genuinely given up on — attempt budget spent, still
+# open, never recovered — surfaced honestly instead of quietly aging off the
+# dashboard. Mirrors cases.stop_reason()'s "attempt budget spent" branch.
+_EXCEPTIONS = (
+    select(
+        RecoveryCase.risk_type,
+        RecoveryCase.subject_ref,
+        RecoveryCase.amount_at_risk,
+        RecoveryCase.attempts_used,
+        RecoveryCase.max_attempts,
+    )
+    .where(
+        RecoveryCase.state.not_in(
+            ["recovered", "exhausted", "abandoned", "expired", "opted_out"]
+        ),
+        RecoveryCase.attempts_used >= RecoveryCase.max_attempts,
+    )
+    .order_by(RecoveryCase.opened_at.desc())
+    .limit(10)
+)
+
+# In-flight attempt counts. Separate from _OVERVIEW because they read a
+# different table — the old single statement stitched both together with
+# scalar subqueries, which is what made it a string in the first place.
+_INFLIGHT = select(
+    func.count(RetryAttempt.id).filter(RetryAttempt.result == "pending"),
+    func.count(RetryAttempt.id).filter(RetryAttempt.result == "scheduled"),
+)
+
+
+def _label_icon(risk_type: str) -> tuple[str, str]:
+    """Display label and icon for a risk type, falling back to the raw name."""
+    copy = _CHASER_COPY.get(risk_type, {})
+    return copy.get("label", risk_type.replace("_", " ")), copy.get("icon", "card")
+
+
+async def _console_data() -> dict[str, Any] | None:
+    """Aggregate console numbers, or None when the database is unreachable."""
+    # Every query runs inside ONE session block. The receivables reads used to
+    # sit after it, using `session` once the context manager had already closed
+    # it — each wrapped in its own try/except, so the panel degraded to empty
+    # instead of failing loudly. A console that silently renders zeros is worse
+    # than one that says "not connected": the merchant reads the zeros as their
+    # business, not as a bug.
+    ar_aging: list[dict[str, Any]] = []
+    days_to_pay: float | None = None
+    promise_stats: dict[str, Any] = {"kept_rate": None}
+    alerts: list[dict[str, Any]] = []
+
+    try:
+        async with async_session_factory() as session:
+            (
+                cases,
+                recovered_cases,
+                at_risk_paise,
+                recovered_paise,
+                attributed_paise,
+            ) = (await session.execute(_OVERVIEW)).one()
+            chaser_rows = (await session.execute(_CHASERS)).all()
+            recent_rows = (await session.execute(_RECENT)).all()
+            actions_blocked, compliance_blocks = (
+                await session.execute(_GUARDRAIL)
+            ).one()
+            exception_rows = (await session.execute(_EXCEPTIONS)).all()
+            pending, scheduled = (await session.execute(_INFLIGHT)).one()
+            nav = await _nav_counts(session)
+
+            # ── The receivables panel (B2B layer) ────────────────────────
+            # Aging buckets, days-to-pay and promise effectiveness from the
+            # receivables layer's analytics; the alerts feed is the merchant's
+            # undelivered writeback queue. Aggregate and PII-free throughout:
+            # refs and amounts, never a customer email or phone.
+            from src.receivables import aging as ar_aging_mod
+
+            for bucket in await ar_aging_mod.aging_buckets(session):
+                ar_aging.append(
+                    {
+                        "label": bucket["label"],
+                        "count": bucket["count"],
+                        "outstanding": _money(int(bucket["outstanding_paise"])),
+                    }
+                )
+            days_to_pay = await ar_aging_mod.avg_days_to_pay(session)
+            promise_stats = await ar_aging_mod.promise_effectiveness(session)
+
+            # The features that shipped and were never surfaced. Each is one
+            # indexed read; they run in this same session block so a database
+            # that goes away mid-page fails the whole console honestly rather
+            # than rendering half a truth.
+            promises = await console_data.promise_panel(session)
+            plans = await console_data.plan_panel(session)
+            disputes = await console_data.dispute_panel(session)
+            voice = await console_data.voice_panel(session)
+            ladder = await console_data.ladder_panel(session)
+            health = await console_data.engine_health(session)
+            outstanding = await console_data.outstanding_total(session)
+            flight = await console_data.in_flight(session)
+            activity = await console_data.activity_feed(session)
+            stopping = await console_data.stopping_rules(session)
+            from src import downtime as _downtime
+            live_downtime = await _downtime.current()
+
+            alert_rows = (
+                await session.execute(
+                    select(
+                        MerchantAlert.event_type,
+                        MerchantAlert.account_ref,
+                        MerchantAlert.case_ref,
+                        MerchantAlert.created_at,
+                    )
+                    # `delivered.is_(False)`, not raw `delivered = 0`. The
+                    # column is Boolean: SQLite accepts the integer compare and
+                    # Postgres refuses it outright ("operator does not exist:
+                    # boolean = integer"), so the alerts feed worked in tests
+                    # and was permanently empty in production — swallowed by
+                    # the old per-query except.
+                    .where(MerchantAlert.delivered.is_(False))
+                    .order_by(MerchantAlert.created_at.desc())
+                    .limit(10)
+                )
+            ).mappings().all()
+            for row in alert_rows:
+                alerts.append(
+                    {
+                        "event_type": row["event_type"],
+                        "account_ref": row["account_ref"],
+                        "case_ref": row["case_ref"],
+                        "when": (
+                            _ist(row["created_at"]).strftime("%d %b, %H:%M")
+                            if row["created_at"] is not None
+                            else ""
+                        ),
+                    }
+                )
+    except Exception:
+        logger.exception("Merchant console data query failed")
+        return None
+
+    cases = int(cases)
+    recovered_cases = int(recovered_cases)
+
+    chasers: list[dict[str, Any]] = []
+    for risk_type, rc, rec, at_risk, recovered_amt, attributed in chaser_rows:
+        rc, rec = int(rc), int(rec)
+        label, icon = _label_icon(str(risk_type))
+        chasers.append(
+            {
+                "risk_type": risk_type,
+                "label": label,
+                "icon": icon,
+                "cases": rc,
+                "recovered": rec,
+                "rate": round(rec / rc * 100, 1) if rc else 0.0,
+                "at_risk": _money(int(at_risk)),
+                "recovered_amt": _money(int(recovered_amt)),
+                "attributed": _money(int(attributed)),
+            }
+        )
+
+    recent: list[dict[str, Any]] = []
+    for risk_type, subject_ref, amount, recovered_at in recent_rows:
+        label, icon = _label_icon(str(risk_type))
+        recent.append(
+            {
+                "label": label,
+                "icon": icon,
+                "subject_ref": subject_ref,
+                "amount": _money(int(amount)),
+                "when": (
+                    _ist(recovered_at).strftime("%d %b, %H:%M")
+                    if recovered_at is not None
+                    else ""
+                ),
+            }
+        )
+
+    exceptions: list[dict[str, Any]] = []
+    for risk_type, subject_ref, at_risk, used, allowed in exception_rows:
+        label, icon = _label_icon(str(risk_type))
+        exceptions.append(
+            {
+                "label": label,
+                "icon": icon,
+                "subject_ref": subject_ref,
+                "at_risk": _money(int(at_risk)),
+                "attempts_used": int(used),
+                "max_attempts": int(allowed),
+                "reason": f"attempt budget spent ({used}/{allowed})",
+            }
+        )
+
+    return {
+        "cases": cases,
+        "recovered_cases": recovered_cases,
+        "recovery_rate": round(recovered_cases / cases * 100, 1) if cases else 0.0,
+        "at_risk": _money(int(at_risk_paise)),
+        "recovered": _money(int(recovered_paise)),
+        "attributed": _money(int(attributed_paise)),
+        "pending": int(pending),
+        "scheduled": int(scheduled),
+        "chasers": chasers,
+        "recent": recent,
+        "has_data": cases > 0,
+        # Scoreboard honesty: what the policy engine actually refused, not
+        # just what it approved. "0 compliance blocks" only means something
+        # because this number is a live query, not a claim.
+        "actions_blocked": int(actions_blocked),
+        "compliance_blocks": int(compliance_blocks),
+        "exceptions": exceptions,
+        # The B2B receivables panel: aging, days-to-pay, promise
+        # effectiveness, and the merchant's undelivered alerts feed — all
+        # from the receivables layer, all PII-free (refs and amounts only).
+        "ar_aging": ar_aging,
+        "ar_days_to_pay": days_to_pay,
+        "ar_promise": promise_stats,
+        "ar_alerts": alerts,
+        # ── Previously invisible ─────────────────────────────────────────
+        # Promises, plans, disputes, the voice queue and the dunning ladder
+        # all shipped with tables, sweeps and tests, and none of them had a
+        # merchant-facing surface: the console read three tables out of a
+        # dozen. src/merchant/console_data.py is the read layer.
+        "promises": promises,
+        "plans": plans,
+        "disputes": disputes,
+        "voice": voice,
+        "ladder": ladder,
+        # Is the engine ticking at all — the question every number above
+        # silently assumes a "yes" to.
+        "health": health,
+        # The BALANCE, not the opening figure. See console_data.
+        "outstanding": outstanding,
+        "flight": flight,
+        "activity": activity,
+        "stopping": stopping,
+        "downtime": {
+            "available": live_downtime.available,
+            # NOT "items": Jinja resolves `data.downtime.items` to dict.items,
+            # the bound method, and renders a TypeError instead of the rows.
+            "rails": live_downtime.summary(),
+        },
+        # The worklist, assembled from the panels above rather than re-read:
+        # everything the engine deliberately stopped short of and cannot
+        # resolve without a person. Empty is a real answer the page states.
+        "attention": console_data.attention_items(
+            disputes=disputes,
+            voice=voice,
+            plans=plans,
+            exceptions=exceptions,
+            health=health,
+        ),
+        # The navigation's badges. Read in the same session block as
+        # everything else, so the ledger costs one connection, not two.
+        "nav": nav,
+    }
+
+
+# ── Routes ──────────────────────────────────────────────────────────────────
+@router.get("/console", response_class=HTMLResponse)
+async def landing(request: Request) -> Any:
+    """Public product landing. Product facts only; no database, no live numbers."""
+    settings = get_settings()
+    return templates.TemplateResponse(
+        request,
+        "landing.html",
+        {
+            "merchant_name": settings.merchant_name or None,
+            "public_base_url": settings.public_base_url or None,
+            "chasers": _chaser_cards(),
+            "ladder_rungs": _ladder_rungs(),
+            "authed": _session_valid(request),
+        },
+    )
+
+
+@router.get("/foundation", response_class=HTMLResponse, include_in_schema=False)
+async def foundation(request: Request) -> Any:
+    """
+    The scroll-told product story — the engine's front door, shaped like a
+    product launch page: dark, one idea per screen, measured numbers only.
+
+    Same trust level as /console: every figure here is a fact from the repo's
+    own eval harness (hardcoded, because eval/results are not importable data
+    and must never drift silently — the README and eval_methodology.md carry
+    the full provenance and the CI eval-reproduction job fails if the
+    headline moves). No database, no session, nothing user-specific. The
+    landing (/console) remains the operational door for a signed-in
+    operator; this page is the one a stranger or a funder opens.
+    """
+    settings = get_settings()
+    return templates.TemplateResponse(
+        request,
+        "foundation.html",
+        {
+            "merchant_name": settings.merchant_name or None,
+            "public_base_url": settings.public_base_url or None,
+            "authed": _session_valid(request),
+        },
+    )
+
+
+@router.get("/model", response_class=HTMLResponse)
+async def model(request: Request) -> Any:
+    """The decision layer, as a page. Product facts only; no database.
+
+    Same trust level as /console: everything here is read from the source tree
+    or from the eval's committed result file, so it is safe on a public
+    deployment. The one act carrying measured numbers omits itself entirely
+    when those numbers are not on disk.
+    """
+    settings = get_settings()
+    return templates.TemplateResponse(
+        request,
+        "model.html",
+        {
+            "merchant_name": settings.merchant_name or None,
+            "classes": _failure_classes(),
+            "actions": _action_space(),
+            "rules": _gate_rules(),
+            "results": _eval_headline(),
+            "authed": _session_valid(request),
+        },
+    )
+
+
+def _login_page(request: Request, *, error: str | None = None) -> Any:
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "configured": _password_configured(),
+            "error": error,
+            "merchant_name": get_settings().merchant_name or None,
+        },
+    )
+
+
+@router.get("/console/login", response_class=HTMLResponse)
+async def login_form(request: Request) -> Any:
+    if _password_configured() and _session_valid(request):
+        return RedirectResponse("/console/live", status_code=303)
+    return _login_page(request)
+
+
+@router.post("/console/login")
+async def login_submit(request: Request) -> Any:
+    if not _password_configured():
+        return _login_page(request)
+
+    form = await request.form()
+    supplied = str(form.get("password", ""))
+    ip = client_ip(request)
+
+    wait = _login_locked_seconds(ip)
+    if wait:
+        return _login_page(
+            request, error=f"Too many attempts. Sign-in reopens in {wait}s."
+        )
+
+    expected = _console_password()
+    if supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
+        _LOGIN_FAILURES.pop(ip, None)
+        response = RedirectResponse("/console/live", status_code=303)
+        response.set_cookie(
+            _SESSION_COOKIE,
+            _mint_session(),
+            max_age=_SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=_cookie_secure(),
+            path="/console",
+        )
+        return response
+
+    _record_login_failure(ip)
+    logger.warning("Failed merchant console sign-in from %s", ip)
+    return _login_page(request, error="Incorrect password")
+
+
+@router.post("/console/logout")
+async def logout(request: Request) -> Any:
+    response = RedirectResponse("/console", status_code=303)
+    response.delete_cookie(_SESSION_COOKIE, path="/console")
+    return response
+
+
+@router.get("/console/live", response_class=HTMLResponse)
+async def live_console(request: Request) -> Any:
+    """The merchant's live recovery numbers. Gated, aggregate, PII-free."""
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    data = await _console_data()
+    settings = get_settings()
+    return templates.TemplateResponse(
+        request,
+        "live.html",
+        {
+            "merchant_name": settings.merchant_name or None,
+            "db_ok": data is not None,
+            "data": data,
+            # Lifted out of `data` so the template reads it the same way every
+            # other console page does — the macro takes one argument named
+            # `nav` and must not have to know which page it is on.
+            "nav": (data or {}).get("nav"),
+        },
+    )
+
+
+# ── The rest of the console ─────────────────────────────────────────────────
+# These five pages used to be a SEPARATE Streamlit service. Two consoles meant
+# two hosts, two passwords and two cold starts, and the operator one sat
+# silently broken because nobody had a reason to open it. They are ordinary
+# routes now: same app, same session cookie, same PII-free contract.
+
+
+def _gate(request: Request) -> Any | None:
+    """Shared entry check. Returns a response to send, or None to continue."""
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+    return None
+
+
+def _eval_summary() -> dict[str, Any]:
+    """
+    The eval harness's own output, read from disk. Never computed here.
+
+    The numbers on that page are a claim about whether the agent beats a fixed
+    baseline; recomputing them in a web request would make the page the source
+    of truth for its own marking. It reads the file the harness wrote or says
+    there isn't one.
+    """
+    import json
+    from pathlib import Path
+
+    results = Path("eval/results/eval_results.json")
+    try:
+        with results.open() as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"available": False}
+
+    policies = raw.get("policies")
+    if not isinstance(policies, dict) or not policies:
+        return {"available": False}
+
+    rows: list[dict[str, Any]] = []
+    for name, m in policies.items():
+        if not isinstance(m, dict):
+            continue
+        rows.append({
+            "name": name,
+            "recovery_raw": float(m.get("recovery_rate_%") or 0.0),
+            "recovery": round(float(m.get("recovery_rate_%") or 0.0), 2),
+            "recovery_std": round(float(m.get("recovery_rate_%_std") or 0.0), 2) or None,
+            "attempts": round(float(m.get("retry_cost_avg") or 0.0), 2),
+            "false_retry": round(float(m.get("false_retry_rate_%") or 0.0), 2),
+            "net": _money(int(float(m.get("net_₹_per_₹1Cr_failed") or 0.0) * 100)),
+            "net_raw": float(m.get("net_₹_per_₹1Cr_failed") or 0.0),
+        })
+    if not rows:
+        return {"available": False}
+
+    rows.sort(key=lambda r: r["net_raw"], reverse=True)
+    best = max(r["net_raw"] for r in rows)
+    for r in rows:
+        r["best"] = r["net_raw"] == best and best > 0
+
+    # The paired comparison, which is the part that makes any of this a
+    # claim rather than a number. Each scenario is run under every policy
+    # with the identical random sequence, so outcomes are differenced
+    # one-to-one and a difference is only called real when the 95% CI
+    # excludes zero. The page showed the per-policy rates and dropped this
+    # entirely — the rates alone cannot tell you whether the gap is signal.
+    paired: list[dict[str, Any]] = []
+    for name, metrics in (raw.get("paired_vs_baseline") or {}).items():
+        if not isinstance(metrics, dict):
+            continue
+        rr = metrics.get("recovery_rate_pp") or {}
+        cost = metrics.get("retry_cost") or {}
+        ci = rr.get("ci95") or [None, None]
+        if rr.get("mean_delta") is None:
+            continue
+        paired.append({
+            "name": name,
+            "delta_pp": round(float(rr["mean_delta"]), 2),
+            "ci_low": round(float(ci[0]), 2) if ci[0] is not None else None,
+            "ci_high": round(float(ci[1]), 2) if ci[1] is not None else None,
+            "n": int(rr.get("n_paired") or 0),
+            "significant": bool(rr.get("significant")),
+            "attempts_delta": (
+                round(float(cost["mean_delta"]), 2)
+                if cost.get("mean_delta") is not None else None
+            ),
+        })
+    paired.sort(key=lambda r: r["delta_pp"], reverse=True)
+
+    # Retry economics. break_even is None when a policy wins even if a retry
+    # is free — which is a stronger statement than any particular cost
+    # assumption, and the reason the harness reports it that way.
+    economics: list[dict[str, Any]] = []
+    for name, e in (raw.get("economics_vs_baseline") or {}).items():
+        if not isinstance(e, dict):
+            continue
+        economics.append({
+            "name": name,
+            "delta_revenue": _money(
+                int(float(e.get("delta_revenue_per_crore") or 0.0) * 100)
+            ),
+            "delta_attempts": int(float(e.get("delta_attempts_per_crore") or 0.0)),
+            "break_even": e.get("break_even_cost_per_retry_inr"),
+            "verdict": e.get("verdict") or "—",
+        })
+
+    return {
+        "available": True,
+        "policies": rows,
+        "max_recovery": max(r["recovery_raw"] for r in rows) or 1.0,
+        "retry_cost": raw.get("retry_cost_inr", "—"),
+        "paired": paired,
+        "economics": economics,
+        "n_paired": max((p["n"] for p in paired), default=0),
+    }
+
+
+async def _nav_counts(session: Any) -> dict[str, int] | None:
+    """The navigation's badge counts, or None if they could not be read.
+
+    None rather than zeros on failure, and the macro then omits the badges:
+    a "0 disputes" a merchant believes is worse than no badge, and this read
+    runs on every page so it must never be the thing that fails one.
+    """
+    try:
+        return await console_data.nav_counts(session)
+    except Exception:
+        logger.warning("Navigation counts unavailable", exc_info=True)
+        return None
+
+
+async def _render_console(
+    request: Request, template: str, build: Any, **extra: Any
+) -> Any:
+    """One shape for every console page: gate, read, render, and stay up.
+
+    A failure here renders the page with `db_ok=False` rather than a 500: a
+    console that cannot read is a fact the merchant needs stated, not a stack
+    trace.
+    """
+    gated = _gate(request)
+    if gated is not None:
+        return gated
+
+    data: dict[str, Any] = {}
+    nav: dict[str, int] | None = None
+    db_ok = True
+    try:
+        async with async_session_factory() as session:
+            data = await build(session)
+            nav = await _nav_counts(session)
+    except Exception:
+        logger.exception("Console page %s could not read the database", template)
+        db_ok = False
+
+    return templates.TemplateResponse(
+        request, template,
+        {
+            "merchant_name": get_settings().merchant_name or None,
+            "db_ok": db_ok, "data": data, "nav": nav, **extra,
+        },
+    )
+
+
+@router.get("/console/pipeline", response_class=HTMLResponse)
+async def console_pipeline(request: Request) -> Any:
+    """Where money leaves the pipeline, and what the gateway blamed."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "funnel": await console_data.pipeline_funnel(session),
+            "causes": await console_data.failure_causes(session),
+            "min_sample": console_data.FAILURE_CLASS_MIN_SAMPLE,
+        }
+
+    return await _render_console(request, "console_pipeline.html", build)
+
+
+@router.get("/console/routing", response_class=HTMLResponse)
+async def console_routing(request: Request) -> Any:
+    """Which bank, on which rail — the evidence behind switch_rail."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"routing": await console_data.routing_panel(session)}
+
+    return await _render_console(request, "console_routing.html", build)
+
+
+@router.get("/console/cases", response_class=HTMLResponse)
+async def console_cases(request: Request) -> Any:
+    """Every case, filterable by state. References are the merchant's own."""
+    state = request.query_params.get("state", "all")
+    if state != "all" and state not in {
+        "open", "recovered", "exhausted", "abandoned", "expired", "opted_out",
+    }:
+        state = "all"
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "cases": await console_data.case_list(session, state=state),
+            "states": await console_data.case_states(session),
+        }
+
+    return await _render_console(request, "console_cases.html", build, state=state)
+
+
+@router.get("/console/payments", response_class=HTMLResponse)
+async def console_payments(request: Request) -> Any:
+    """
+    The payment rail's own view: what failed, why, and where it got to.
+
+    Distinct from /console/cases on purpose. A case is the recovery wrapped
+    around a payment, so the case list answers "what are we chasing"; this
+    answers "what failed", which is the question a merchant actually opens the
+    console with.
+
+    Both filters are validated against the values the read implements. An
+    unrecognised one falls back to "all" — the same behaviour as the cases
+    page, and safe here only because the filter bar then marks "all payments"
+    as the active pill: the page never claims to be filtered when it is not,
+    which is the failure mode worse than having no filter at all.
+    """
+    state = request.query_params.get("state", "all")
+    valid_states = {value for value, _label in console_data.PAYMENT_STATES}
+    if state != "all" and state not in valid_states:
+        state = "all"
+    fclass = request.query_params.get("class", "all")
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "payments": await console_data.payment_list(
+                session, state=state, failure_class=fclass
+            )
+        }
+
+    return await _render_console(
+        request, "console_payments.html", build, state=state, fclass=fclass
+    )
+
+
+@router.get("/console/batch", response_class=HTMLResponse)
+async def console_batch(request: Request) -> Any:
+    """Preview a cohort: eligible, blocked, and why — before anything runs."""
+    fclass = request.query_params.get("class") or None
+
+    async def build(session: Any) -> dict[str, Any]:
+        from src import recovery_batch
+
+        data: dict[str, Any] = {"cohorts": await recovery_batch.cohorts(session)}
+        if fclass:
+            plan = await recovery_batch.plan(session, failure_class=fclass)
+            data["plan"] = plan.summary()
+            # A sample, not the cohort: the point is to show the SHAPE of the
+            # decisions, and a page rendering 500 identical rows shows less.
+            data["approved_sample"] = [
+                {"ref": c.ref, "action": c.action, "rail": c.rail,
+                 "confidence": round(c.confidence * 100) if c.confidence else None,
+                 "reason": c.reason, "case_id": str(c.case_id)}
+                for c in plan.approved[:8]
+            ]
+            data["blocked_sample"] = [
+                {"ref": c.ref, "reasons": c.blocked_by, "case_id": str(c.case_id)}
+                for c in plan.blocked[:8]
+            ]
+        return data
+
+    return await _render_console(
+        request, "console_batch.html", build,
+        fclass=fclass, demo_mode=get_settings().demo_mode,
+    )
+
+
+@router.post("/console/batch/run", response_class=HTMLResponse)
+async def console_batch_run(request: Request) -> Any:
+    """
+    Execute the approved half of a cohort.
+
+    POST, not GET: this spends attempt budget and calls the gateway. It also
+    re-validates every case against the guardrail rather than trusting the
+    preview — see recovery_batch.execute().
+    """
+    form = await request.form()
+    fclass = str(form.get("class") or "") or None
+
+    async def build(session: Any) -> dict[str, Any]:
+        from src import recovery_batch
+
+        plan = await recovery_batch.plan(session, failure_class=fclass)
+        result = await recovery_batch.execute(session, plan)
+        return {
+            "cohorts": await recovery_batch.cohorts(session),
+            "plan": plan.summary(),
+            "result": result,
+        }
+
+    return await _render_console(
+        request, "console_batch.html", build,
+        fclass=fclass, demo_mode=get_settings().demo_mode,
+    )
+
+
+@router.post("/console/dispute/resolve", response_class=HTMLResponse)
+async def console_resolve_dispute(request: Request) -> Any:
+    """
+    A human's verdict on a disputed invoice, from the console.
+
+    The console has rendered "Chasing is frozen on these until you uphold or
+    reject the dispute" while offering no way to do either — the only handler
+    was POST /ar/cases/dispute, an HMAC-signed JSON endpoint a merchant on a
+    laptop cannot reach. A worklist naming an action it does not offer is worse
+    than not showing the row: it tells someone their money is stuck and hands
+    them nothing.
+
+    Session-gated like every other console page (_render_console runs the same
+    gate), POST because it closes cases and restarts chases. `resolve_dispute`
+    is idempotent, so a double-submit is harmless.
+    """
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    form = await request.form()
+    dispute_id = str(form.get("dispute_id") or "")
+    outcome = str(form.get("outcome") or "")
+
+    # Both are user input on a money path: an unknown outcome string would
+    # otherwise reach resolve_dispute, and "upheld" closes a case.
+    if outcome not in ("upheld", "rejected") or not dispute_id:
+        logger.warning(
+            "Dispute resolve refused: id=%r outcome=%r", dispute_id, outcome
+        )
+        return RedirectResponse("/console/disputes", status_code=303)
+
+    try:
+        key = uuid.UUID(dispute_id)
+    except ValueError:
+        logger.warning("Dispute resolve: malformed id %r", dispute_id)
+        return RedirectResponse("/console/disputes", status_code=303)
+
+    from src.receivables.disputes import resolve_dispute
+    from src.receivables.models import CaseDispute
+
+    # Module-level async_session_factory on purpose, not a local import: the
+    # console's tests patch it by module attribute, and a function-local import
+    # would silently bind the real one and write to the wrong database.
+
+    async with async_session_factory() as session:
+        dispute = await session.get(CaseDispute, key)
+        if dispute is not None:
+            await resolve_dispute(session, dispute, outcome=outcome)
+            await session.commit()
+            logger.info("Dispute %s resolved from console: %s", key, outcome)
+
+    # Redirect rather than render: a refresh on a rendered POST re-submits the
+    # verdict, and while resolve_dispute is idempotent, the merchant should not
+    # be relying on that to avoid re-deciding a case by pressing F5.
+    return RedirectResponse("/console/disputes", status_code=303)
+
+
+@router.post("/console/task/done", response_class=HTMLResponse)
+async def console_task_done(request: Request) -> Any:
+    """
+    Close a human call task from the console.
+
+    The ladder has shown `open_call_tasks` as a bare COUNT since it was built:
+    work exists, somewhere, for someone. The list and this button are the other
+    half. `complete_task` is idempotent, so a double-submit is harmless.
+    """
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    form = await request.form()
+    raw = str(form.get("task_id") or "")
+    try:
+        task_id = uuid.UUID(raw)
+    except ValueError:
+        logger.warning("Task done: malformed id %r", raw)
+        return RedirectResponse("/console/live", status_code=303)
+
+    from src.receivables.models import AccountTask
+    from src.receivables.tasks import complete_task
+
+    async with async_session_factory() as session:
+        task = await session.get(AccountTask, task_id)
+        if task is not None:
+            await complete_task(session, task)
+            await session.commit()
+            logger.info("Call task %s closed from console", task_id)
+
+    return RedirectResponse("/console/live", status_code=303)
+
+
+@router.post("/console/case/paid", response_class=HTMLResponse)
+async def console_case_paid(request: Request) -> Any:
+    """
+    Record money that arrived outside the payment rail, from the console.
+
+    NEFT, a cheque, cash, a UPI transfer taken by hand: none of it touches
+    Razorpay, so no webhook can ever tell us. The console showed an outstanding
+    balance it had no way to let anyone close, and the case went on spending
+    attempts chasing money already in the bank. `record_external_payment` has
+    existed the whole time behind an HMAC-signed endpoint a person on a laptop
+    cannot reach.
+
+    Rupees in the form, paise in the call: the field a human types into is
+    labelled in rupees, and the conversion happens once, here, rather than
+    asking anyone to think in paise on a money form.
+    """
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    form = await request.form()
+    case_id = str(form.get("case_id") or "")
+    paid_ref = str(form.get("paid_ref") or "").strip()
+    method = str(form.get("method") or "neft")
+    back = f"/console/case/{case_id}" if case_id else "/console/live"
+
+    if method not in ("neft", "rtgs", "imps", "cheque", "cash", "upi_manual"):
+        logger.warning("External payment: unknown method %r", method)
+        return RedirectResponse(back, status_code=303)
+    try:
+        amount_paise = int(str(form.get("amount_inr") or "0")) * 100
+    except ValueError:
+        amount_paise = 0
+    if amount_paise <= 0 or not paid_ref:
+        logger.warning(
+            "External payment refused: amount=%s ref=%r", amount_paise, paid_ref
+        )
+        return RedirectResponse(back, status_code=303)
+
+    from src.receivables.external import record_external_payment
+
+    async with async_session_factory() as session:
+        outcome = await record_external_payment(
+            session,
+            case_id=case_id,
+            amount_paise=amount_paise,
+            paid_ref=paid_ref[:255],
+            method=method,
+        )
+        await session.commit()
+    logger.info("External payment on case %s: %s", case_id, outcome)
+    return RedirectResponse(back, status_code=303)
+
+
+@router.get("/console/case/{case_id}", response_class=HTMLResponse)
+async def console_case(request: Request, case_id: str) -> Any:
+    """One case as the whole decision chain, over its audit trail."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "case": await console_data.case_detail(session, case_id),
+            "guardrail": await console_data.guardrail_trace(session, case_id),
+        }
+
+    return await _render_console(request, "console_case.html", build)
+
+
+@router.get("/console/accounts", response_class=HTMLResponse)
+async def console_accounts(request: Request) -> Any:
+    """
+    The buyer directory. The console had no account view at all.
+
+    B2B collection runs on the ACCOUNT, and the only per-account surface in the
+    product was the customer-facing /statement/<token> — so a merchant could
+    not answer "which buyers owe us most" or "do we have a finance manager on
+    file for this one", and the second question decides whether the ladder can
+    escalate to anybody.
+    """
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"accounts": await console_data.accounts_panel(session)}
+
+    return await _render_console(request, "console_accounts.html", build)
+
+
+@router.get("/console/account/{account_id}", response_class=HTMLResponse)
+async def console_account(request: Request, account_id: str) -> Any:
+    """One buyer: contacts by role, what they owe, what we last sent."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        try:
+            key = uuid.UUID(account_id)
+        except ValueError:
+            return {"account": None}
+        return {"account": await console_data.account_detail(session, key)}
+
+    return await _render_console(request, "console_account.html", build)
+
+
+@router.post("/console/account/contact", response_class=HTMLResponse)
+async def console_add_contact(request: Request) -> Any:
+    """
+    Record a person at the buyer's desk.
+
+    `add_contact` has existed since the receivables module landed, reachable
+    from nothing: there was no directory, no form, and no way to correct a
+    contact who had left. An account with no contact for a role is an account
+    the ladder cannot escalate to, and nothing said so.
+    """
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    form = await request.form()
+    raw_account = str(form.get("account_id") or "")
+    role = str(form.get("role") or "")
+    email = str(form.get("email") or "").strip()
+    back = f"/console/account/{raw_account}" if raw_account else "/console/accounts"
+
+    # The role vocabulary is the ladder's, not free text: a rung addresses
+    # roles by name, so an unknown role is a contact no rung will ever reach.
+    if role not in ("ap_clerk", "finance_manager", "escalation"):
+        logger.warning("Add contact: unknown role %r", role)
+        return RedirectResponse(back, status_code=303)
+    if "@" not in email or len(email) > 255:
+        logger.warning("Add contact: unusable email")
+        return RedirectResponse(back, status_code=303)
+    try:
+        account_id = uuid.UUID(raw_account)
+    except ValueError:
+        logger.warning("Add contact: malformed account id %r", raw_account)
+        return RedirectResponse("/console/accounts", status_code=303)
+
+    from src.receivables.accounts import add_contact
+    from src.receivables.models import ArAccount
+
+    async with async_session_factory() as session:
+        if await session.get(ArAccount, account_id) is None:
+            logger.warning("Add contact: no such account %s", account_id)
+            return RedirectResponse("/console/accounts", status_code=303)
+        await add_contact(
+            session,
+            account_id=account_id,
+            role=role,
+            email=email,
+            name=(str(form.get("name") or "").strip() or None),
+            phone=(str(form.get("phone") or "").strip() or None),
+        )
+        await session.commit()
+        logger.info("Contact added to account %s as %s", account_id, role)
+
+    return RedirectResponse(back, status_code=303)
+
+
+@router.get("/console/messages", response_class=HTMLResponse)
+async def console_messages(request: Request) -> Any:
+    """
+    Every message the engine sends, rendered by the sender's own functions.
+
+    The engine writes SMS and email that go out under the merchant's name, and
+    the merchant had no way to read one. Rendering through the real
+    `render_fallback` and `compose_stage_message` rather than a copy is the
+    whole point: a preview that could drift from what ships would be worse
+    than not having one.
+    """
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"messages": await console_data.message_preview(session)}
+
+    return await _render_console(request, "console_messages.html", build)
+
+
+# ── Operator-view marker ────────────────────────────────────────────────────
+# The console session cookie is scoped to path=/console on purpose: a customer
+# page must never carry operator authority. That scoping also means the
+# customer route cannot see it, so it cannot tell an operator preview from a
+# real customer visit — and every preview would land in the nudge
+# click-through figures as if the customer had opened their page.
+#
+# So the console sets a second, deliberately tiny cookie on the way out: it
+# grants nothing, names one case, dies in ten minutes, and is signed with the
+# same console secret, so forging one needs the console password. Its only
+# effect is the `actor` on one audit row.
+_PREVIEW_COOKIE = "recovery_preview"
+_PREVIEW_TTL_SECONDS = 600
+
+
+def _mint_preview_marker(case_id: uuid.UUID) -> str:
+    payload = f"{case_id.hex}{SEP}{int(time.time()) + _PREVIEW_TTL_SECONDS}"
+    return f"{b64(payload.encode())}{SEP}{sign(payload, _console_password() or '')}"
+
+
+def preview_marker_names(request: Request, case_id: uuid.UUID) -> bool:
+    """True when this request carries a live console-issued marker for this case.
+
+    Read by src/customer/routes.py to label the view. One failure value for
+    every kind of failure — unset, malformed, forged, expired, someone else's
+    case — because none of them is worth distinguishing.
+    """
+    secret = _console_password()
+    token = request.cookies.get(_PREVIEW_COOKIE)
+    if not secret or not token or token.count(SEP) != 1:
+        return False
+    encoded, signature = token.split(SEP)
+    try:
+        payload = unb64(encoded).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not hmac.compare_digest(
+        sign(payload, secret).encode("ascii"), signature.encode("utf-8", "replace")
+    ):
+        return False
+    if payload.count(SEP) != 1:
+        return False
+    named, _, expiry = payload.partition(SEP)
+    try:
+        if int(expiry) < int(time.time()):
+            return False
+    except ValueError:
+        return False
+    return hmac.compare_digest(named, case_id.hex)
+
+
+@router.get("/console/customer", response_class=HTMLResponse)
+async def console_customer(request: Request) -> Any:
+    """
+    The other side of every case — what the customer sees, and whether they
+    looked.
+
+    The console could explain every decision the engine made and could not
+    show the page the customer was actually handed. This is that half. It
+    lists no links: see console_data.customer_view for why, and the POST
+    below for how one is opened.
+    """
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"customer": await console_data.customer_view(session)}
+
+    return await _render_console(request, "console_customer.html", build)
+
+
+@router.post("/console/customer/open")
+async def console_customer_open(request: Request) -> Any:
+    """
+    Open one case's customer page, as the customer sees it.
+
+    A `/recover/<token>` URL is a bearer credential, so this mints a fresh one
+    per click rather than the console holding a list of them, caps it at an
+    hour (the shortest useful life — the operator is looking now, not
+    tomorrow), and writes an audit row naming the operator before redirecting.
+    Someone reading the case trail later can see that the page was opened from
+    the console and not by the customer.
+
+    Redirecting rather than framing is not a shortcut: /recover sets
+    `frame-ancestors 'none'` against UI-redress on its own pay button
+    (src/main.py), and a preview is not a reason to weaken that. The operator
+    gets the real page, in a new tab, with no second rendering to drift.
+    """
+    if not _password_configured():
+        return _login_page(request)
+    if not _session_valid(request):
+        return RedirectResponse("/console/login", status_code=303)
+
+    form = await request.form()
+    raw = str(form.get("case_id") or "")
+    try:
+        case_id = uuid.UUID(raw)
+    except ValueError:
+        logger.warning("Customer view: malformed case id %r", raw)
+        return RedirectResponse("/console/customer", status_code=303)
+
+    from src.models import RecoveryCase
+    from src.recovery_link import mint
+
+    async with async_session_factory() as session:
+        case = await session.get(RecoveryCase, case_id)
+        if case is None:
+            return RedirectResponse("/console/customer", status_code=303)
+        token = mint(case.id, ttl_hours=1)
+        if token is None:
+            # RECOVERY_LINK_SECRET is unset, so the feature is off and every
+            # nudge already ships without a link. The page says so; this is
+            # the guard for a form submitted anyway.
+            return RedirectResponse("/console/customer", status_code=303)
+
+    # No audit row is written here. The page itself writes one when it is
+    # actually served, labelled `operator` by the marker below — and one row
+    # per view, whoever is looking, is the trail worth reading. Writing a
+    # second one here would double every operator view in it.
+
+    response = RedirectResponse(f"/recover/{token}", status_code=303)
+    # Scoped to /recover and gone in ten minutes: it exists only so the view
+    # about to be logged there is attributed to you rather than the customer.
+    response.set_cookie(
+        _PREVIEW_COOKIE,
+        _mint_preview_marker(case_id),
+        max_age=_PREVIEW_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(),
+        path="/recover",
+    )
+    return response
+
+
+@router.get("/console/ops", response_class=HTMLResponse)
+async def console_ops(request: Request) -> Any:
+    """Is the machinery running — sweeps, heartbeat, and what fires next."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "ops": await console_data.operations_panel(session),
+            "health": await console_data.engine_health(session),
+        }
+
+    return await _render_console(request, "console_ops.html", build)
+
+
+@router.get("/console/evidence", response_class=HTMLResponse)
+async def console_evidence(request: Request) -> Any:
+    """The eval harness's verdict. Read from disk, never recomputed here."""
+    gated = _gate(request)
+    if gated is not None:
+        return gated
+    # The page needs no database; its navigation does. Read separately so a
+    # database that is down still renders the evidence — the numbers come off
+    # disk, and there is no reason to lose them to an unrelated outage.
+    nav = None
+    try:
+        async with async_session_factory() as session:
+            nav = await _nav_counts(session)
+    except Exception:
+        logger.warning("Navigation counts unavailable on /console/evidence")
+    return templates.TemplateResponse(
+        request, "console_evidence.html",
+        {
+            "merchant_name": get_settings().merchant_name or None,
+            "db_ok": True,
+            "nav": nav,
+            "data": {"eval": _eval_summary()},
+        },
+    )
+
+
+# ── Phase 04: Receivables ───────────────────────────────────────────────────
+
+
+@router.get("/console/receivables", response_class=HTMLResponse)
+async def console_receivables(request: Request) -> Any:
+    """Aging, ladder and outstanding — the B2B finance view."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        from src.receivables import aging as ar_aging_mod
+
+        aging = []
+        for bucket in await ar_aging_mod.aging_buckets(session):
+            aging.append({
+                "label": bucket["label"],
+                "count": bucket["count"],
+                "outstanding": _money(int(bucket["outstanding_paise"])),
+            })
+        return {
+            "outstanding": await console_data.outstanding_total(session),
+            "days_to_pay": await ar_aging_mod.avg_days_to_pay(session),
+            "aging": aging,
+            "ladder": await console_data.ladder_panel(session),
+            "promises": await console_data.promise_panel(session),
+            "plans": await console_data.plan_panel(session),
+            "disputes": await console_data.dispute_panel(session),
+        }
+
+
+    return await _render_console(request, "console_receivables.html", build)
+
+
+@router.get("/console/promises", response_class=HTMLResponse)
+async def console_promises(request: Request) -> Any:
+    """Who committed to pay, and whether they did."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"promises": await console_data.promise_panel(session)}
+
+    return await _render_console(request, "console_promises.html", build)
+
+
+@router.get("/console/plans", response_class=HTMLResponse)
+async def console_plans(request: Request) -> Any:
+    """Instalment schedules and their progress."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"plans": await console_data.plan_panel(session)}
+
+    return await _render_console(request, "console_plans.html", build)
+
+
+@router.get("/console/disputes", response_class=HTMLResponse)
+async def console_disputes(request: Request) -> Any:
+    """Frozen invoices awaiting your verdict."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"disputes": await console_data.dispute_panel(session)}
+
+    return await _render_console(request, "console_disputes.html", build)
+
+
+# ── Phase 05: Analytics ─────────────────────────────────────────────────────
+
+
+@router.get("/console/analytics/performance", response_class=HTMLResponse)
+async def console_analytics_performance(request: Request) -> Any:
+    """Recovery rate, volume and outcomes by failure class and recovery type."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"performance": await console_data.performance_analytics(session)}
+
+    return await _render_console(
+        request, "console_analytics_performance.html", build
+    )
+
+
+@router.get("/console/analytics/rails", response_class=HTMLResponse)
+async def console_analytics_rails(request: Request) -> Any:
+    """Bank × rail — the evidence behind switch_rail."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"routing": await console_data.routing_panel(session)}
+
+    return await _render_console(request, "console_analytics_rails.html", build)
+
+
+@router.get("/console/analytics/hours", response_class=HTMLResponse)
+async def console_analytics_hours(request: Request) -> Any:
+    """When recoveries land, and where the blackout sits."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"hours": await console_data.hours_analytics(session)}
+
+    return await _render_console(request, "console_analytics_hours.html", build)
+
+
+@router.get("/console/analytics/economics", response_class=HTMLResponse)
+async def console_analytics_economics(request: Request) -> Any:
+    """What the engine recovered, what it cost, and whether it was worth it."""
+    gated = _gate(request)
+    if gated is not None:
+        return gated
+
+    data: dict[str, Any] = {}
+    nav = None
+    db_ok = True
+    try:
+        async with async_session_factory() as session:
+            data["economics"] = await console_data.economics_analytics(session)
+            nav = await _nav_counts(session)
+    except Exception:
+        logger.exception("Analytics economics could not read the database")
+        db_ok = False
+
+    # The eval data is read from disk, not the database — include it even
+    # when db is down, because the eval file is never the thing that breaks.
+    data["eval"] = _eval_summary()
+
+    return templates.TemplateResponse(
+        request, "console_analytics_economics.html",
+        {
+            "merchant_name": get_settings().merchant_name or None,
+            "db_ok": db_ok, "data": data, "nav": nav,
+        },
+    )
+
+
+# ── Phase 06: Voice ─────────────────────────────────────────────────────────
+
+
+@router.get("/console/voice", response_class=HTMLResponse)
+async def console_voice(request: Request) -> Any:
+    """The call queue, outcomes, and the four safety gates."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {
+            "voice": await console_data.voice_panel(session),
+            "voice_calls": await console_data.voice_call_list(session),
+        }
+
+    return await _render_console(request, "console_voice.html", build)
+
+
+# ── Phase 07: Trust Surfaces ────────────────────────────────────────────────
+
+
+@router.get("/console/safety", response_class=HTMLResponse)
+async def console_safety(request: Request) -> Any:
+    """Every safeguard in the engine, its live state."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"safety": await console_data.safety_state(session)}
+
+    return await _render_console(request, "console_safety.html", build)
+
+
+@router.get("/console/activity", response_class=HTMLResponse)
+async def console_activity(request: Request) -> Any:
+    """The audit trail, event by event."""
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"activity": await console_data.activity_page(session)}
+
+    return await _render_console(request, "console_activity.html", build)
+
+
+# ── Phase 08: Search & Settings ─────────────────────────────────────────────
+
+
+@router.get("/console/search", response_class=HTMLResponse)
+async def console_search(request: Request) -> Any:
+    """Find any payment, case, invoice or account by reference."""
+    q = request.query_params.get("q", "").strip()
+
+    async def build(session: Any) -> dict[str, Any]:
+        return {"search": await console_data.search_console(session, q)}
+
+    return await _render_console(request, "console_search.html", build)
+
+
+@router.get("/console/settings", response_class=HTMLResponse)
+async def console_settings(request: Request) -> Any:
+    """What is configured and what is not. Read-only."""
+    gated = _gate(request)
+    if gated is not None:
+        return gated
+
+    # Settings reads no database — only config and module constants.
+    nav = None
+    try:
+        async with async_session_factory() as session:
+            nav = await _nav_counts(session)
+    except Exception:
+        logger.warning("Navigation counts unavailable on /console/settings")
+
+    return templates.TemplateResponse(
+        request, "console_settings.html",
+        {
+            "merchant_name": get_settings().merchant_name or None,
+            "db_ok": True,
+            "nav": nav,
+            "data": {"settings": console_data.settings_view()},
+        },
+    )
+

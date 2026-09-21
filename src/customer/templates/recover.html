@@ -1,0 +1,492 @@
+{#
+  One customer, one failed payment, one page.
+
+  Order is the reader's order of anxiety, not ours:
+    0. who is asking for money   the merchant's name — an SMS link with no
+                                 visible merchant reads as phishing
+    1. how much                  the number they are worried about
+    2. where it physically is    the custody rail — the actual question
+    3. what happened             the timeline, in their words
+    4. what to do                exactly one primary action, with the trust
+                                 strip AT the button where hesitation peaks
+    5. the record                folded away; nobody reads a bank name first
+    6. the way out               opt-out and help, visible but quiet
+
+  `state` is computed server-side in routes.py on every request. This template
+  never infers status from anything it was handed, and the rail below is a
+  rendering of that one variable — it cannot show "received" unless the server
+  said recovered. All chrome strings go through t() (src/customer/i18n.py);
+  the per-class prose comes from explain.py and is the next translation
+  frontier — it renders in English until that pass is native-reviewed.
+#}
+{% extends "base.html" %}
+{% block title %}
+  {% if state == "recovered" %}Payment received{% else %}Your payment{% endif %}
+{% endblock %}
+
+{% block content %}
+
+{#  position           fill class          legend word        spoken sentence  #}
+{% set rail = {
+  "recovered":     ("at-them",    "on-settled",      "Received",       "Received by the merchant."),
+  "confirming":    ("at-transit", "on-hold breathe", "Moving now",     "Your money is in transit right now."),
+  "unknown":       ("at-transit", "on-unknown",      "Not confirmed",  "We cannot confirm where this payment ended up."),
+  "opted_out":     ("at-you",     "on-quiet",        "Still with you", "No money has left your account."),
+  "stopped":       ("at-you",     "on-quiet",        "Still with you", "No money has left your account."),
+  "not_retryable": ("at-you",     "on-quiet",        "Still with you", "No money has left your account."),
+  "payable":       ("at-you",     "",                "Still with you", "No money has left your account."),
+}[state] %}
+
+{% if merchant_name %}
+<div class="hero">
+  <p class="to">{{ t(hero_key) }} <strong>{{ merchant_name }}</strong></p>
+  <p class="sub">{{ t('masthead') }}</p>
+</div>
+{% endif %}
+
+{% set shown = recovered if state == "recovered" else amount %}
+<p class="amount{% if shown|length > 9 %} amount-long{% endif %}">{{ shown }}</p>
+
+<div class="rail">
+  <div class="rail-track" role="img" aria-label="{{ rail[3] }}">
+    <i></i><i></i><i></i>
+    <div class="rail-block {{ rail[0] }} {{ rail[1] }}"></div>
+  </div>
+  <div class="rail-legend" aria-hidden="true">
+    <span {% if rail[0] == "at-you" %}class="here"{% endif %}>{{ t('rail_you') }}</span>
+    <span {% if rail[0] == "at-transit" %}class="here"{% endif %}>{{ t('rail_transit') }}</span>
+    <span {% if rail[0] == "at-them" %}class="here"{% endif %}>{{ t('rail_merchant') }}</span>
+  </div>
+  <p class="rail-verdict">{{ rail[2] }}.</p>
+</div>
+
+{% if state == "recovered" %}
+  <h1>Payment received</h1>
+  <div class="note settled">
+    <p><strong>This payment is complete.</strong> Nothing further is needed.
+    You can close this page.</p>
+  </div>
+  {# The receipt: what they paid, the reference their bank statement will
+     carry, and when. A confirmation that names nothing is not a receipt. #}
+  {% if recovered_ref or recovered_at %}
+  <div class="sec"><h2>{{ t('sec_receipt') }}</h2></div>
+  <dl class="register">
+    {% if recovered %}<div><dt>{{ t('receipt_paid') }}</dt><dd>{{ recovered }}</dd></div>{% endif %}
+    {% if recovered_ref %}<div><dt>{{ t('receipt_reference') }}</dt><dd class="mono">{{ recovered_ref }}</dd></div>{% endif %}
+    {% if recovered_at %}<div><dt>{{ t('receipt_received') }}</dt><dd>{{ recovered_at }} IST</dd></div>{% endif %}
+  </dl>
+  {% endif %}
+
+{% elif state == "confirming" %}
+  <h1>We're confirming your payment</h1>
+  <div class="note hold">
+    <p><strong>Don't pay again yet.</strong> A payment is going through and
+    we're waiting for your bank to confirm it. This usually takes under a
+    minute. Paying now could charge you twice.</p>
+  </div>
+  {% if auto_refresh %}
+  <p class="quiet small">{{ t('confirming_auto') }}</p>
+  {% else %}
+  <p class="quiet small">{{ t('unknown_sms') }}</p>
+  {% endif %}
+  <a class="btn btn-quiet" href="/recover/{{ token }}?r=1">{{ t('check_again') }}</a>
+
+{% elif state == "unknown" %}
+  <h1>We can't confirm this payment yet</h1>
+  <div class="note hold">
+    <p><strong>A payment was started and we haven't had a result.</strong>
+    We're deliberately not offering another attempt, because we can't yet rule
+    out that the first one succeeded. Check your bank statement, or contact
+    support with the reference below.</p>
+  </div>
+  <p class="quiet small">{{ t('unknown_sms') }}</p>
+  <a class="btn btn-quiet" href="/recover/{{ token }}">{{ t('check_again') }}</a>
+
+{% elif state == "opted_out" %}
+  <h1>{{ t('opt_out_done') }}</h1>
+  <div class="note">
+    <p>You asked us not to contact you about this payment, and we haven't.
+    {{ detail.money }}</p>
+  </div>
+
+{% elif state in ("stopped", "not_retryable") %}
+  <h1>{{ detail.headline }}</h1>
+  <div class="note">
+    <p>{{ detail.money }}</p>
+  </div>
+  <div class="sec"><h2>{{ t('sec_what_to_do') }}</h2></div>
+  <p>{{ detail.next }}</p>
+  {% if state == "stopped" %}
+    <p class="quiet small">We're no longer retrying this payment automatically.</p>
+  {% endif %}
+  {% include "_help_and_optout.html" %}
+
+{% else %}{# payable #}
+  <h1>{{ detail.headline }}</h1>
+  <div class="note">
+    <p>{{ detail.money }}</p>
+  </div>
+
+  {# The customer's story in rows. Payment rail: attempted → what the bank
+     said → what is true about a retry. Risk types (cart, subscription,
+     invoice, autopay): what happened → what is true about paying. A log is
+     our view; this is theirs. ------------------------------------------- #}
+  <div class="sec"><h2>{{ t('sec_what_happened') }}</h2></div>
+  {% if is_payment %}
+  <ol class="timeline">
+    <li class="done">
+      <span class="when">{{ t('timeline_attempted_at', date=failed_at.strftime("%d %b, %H:%M")) if failed_at else t('timeline_attempted') }}</span>
+      <p class="what">{{ t('timeline_attempted') }}{% if method %} · {{ method }}{% if bank %} · {{ bank }}{% endif %}{% endif %}</p>
+    </li>
+    <li class="done">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('timeline_result_reason', reason=detail.headline[0].lower() + detail.headline[1:]) if lang == 'en' else t('timeline_result') }}</p>
+    </li>
+    {% if voice_call_when %}
+    <li class="done">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('sequence_call_made', when=voice_call_when) }}</p>
+    </li>
+    {% endif %}
+    <li class="safe">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('timeline_safe') }}</p>
+    </li>
+  </ol>
+  {% else %}
+  <ol class="timeline">
+    <li class="done">
+      <span class="when">{{ t('timeline_attempted_at', date=failed_at.strftime("%d %b, %H:%M")) if failed_at else '' }}</span>
+      <p class="what">{{ t(risk_timeline_key) if risk_timeline_key else detail.headline }}</p>
+    </li>
+    {# Subscription/mandate retry sequence: one row per collection touch
+       actually made, then (only when genuinely scheduled) one upcoming row
+       that states WHEN honestly and stays silent on WHAT — see routes.py. #}
+    {% for a in sequence_attempts %}
+    <li class="done">
+      <span class="when">{{ a.when }}</span>
+      <p class="what">
+        {%- if a.action_type in ("retry_now", "retry_at") %}{{ t('sequence_action_retry') }}
+        {%- elif a.action_type == "switch_rail" %}{{ t('sequence_action_switch_rail') }}
+        {%- else %}{{ t('sequence_action_nudge') }}{% endif -%}
+      </p>
+    </li>
+    {% endfor %}
+    {% if voice_call_when %}
+    <li class="done">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('sequence_call_made', when=voice_call_when) }}</p>
+    </li>
+    {% endif %}
+    {% if sequence_upcoming_when %}
+    <li class="upcoming">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('sequence_upcoming', when=sequence_upcoming_when) }}</p>
+    </li>
+    {% endif %}
+    <li class="safe">
+      <span class="when">&nbsp;</span>
+      <p class="what">{{ t('timeline_safe') }}</p>
+    </li>
+  </ol>
+  {% endif %}
+
+  <div class="sec"><h2>{{ t('sec_what_to_do') }}</h2></div>
+  {% if cart_items and not is_payment %}
+    {# Only when the merchant's event named the items — never invented. #}
+    <p class="quiet small" style="margin:0 0 var(--sp-3)">{{ t('cart_items', items=cart_items) }}</p>
+  {% endif %}
+  <p>{{ detail.next }}</p>
+
+  {# The promise flash. Three outcomes, each named so the customer is never
+     left wondering what the form did. `promise=ok` re-renders payable here —
+     the silence is real (the chase stops) but the page keeps offering the
+     link, because a promise still needs a way to fulfill it. #}
+  {% set promise_flash = request.query_params.get("promise") %}
+  {% if promise_flash == "ok" %}
+    <div class="note settled">
+      <p><strong>Thank you — we've noted your date.</strong> We won't contact
+      you before then. Your payment link below stays open whenever you're
+      ready.</p>
+    </div>
+  {% elif promise_flash == "invalid" %}
+    <div class="note halt">
+      <p><strong>We couldn't read that date.</strong> Pick a date between
+      tomorrow and {{ promise_max_date }} — we can only hold follow-ups for a
+      short, honest window.</p>
+    </div>
+  {% elif promise_flash == "refused" %}
+    <div class="note halt">
+      <p><strong>We can't take another date on this payment.</strong> Earlier
+      commitments here weren't kept. You can still pay now from the button
+      below, any amount, any time before the link expires.</p>
+    </div>
+  {% endif %}
+
+  {% if request.query_params.get("error") %}
+    {# The pay POST bounced back here with ?error=1. Saying nothing hands the
+       customer the same page and lets them believe they mistapped. #}
+    <div class="note halt">
+      <p><strong>We couldn't open the payment page just now.</strong> Nothing was
+      charged and nothing changed. Try again in a moment. If it keeps failing,
+      reply to the message we sent you.</p>
+    </div>
+  {% endif %}
+  {# nosemgrep: django-csrf-blanket — this endpoint does not use session auth.
+   It authenticates by CAPABILITY TOKEN in the path (recovery_link.verify):
+   whoever can forge this POST already holds the token and could just open
+   the page. A CSRF token would be theatre here, not protection. #}
+{% if is_payment and recommended_rail == "upi" and method != "upi" %}
+  {# The engine already ENFORCES this: /pay mints a UPI-only link for these
+     failure classes. Until now the only trace was the button's verb changing.
+     Saying it plainly is the honest version — the recommendation is ours, it
+     is named as ours, and it is computed from recommended_rail alone. Not
+     folded into detail.next: that paragraph explains the decline; this is a
+     recommendation about what to do next, and they are different claims. #}
+  <div class="note">
+    <p><strong>{{ t('rail_recommend_upi') }}</strong> {{ t('rail_recommend_upi_why') }}</p>
+  </div>
+{% endif %}
+<!-- nosemgrep: python.django.security.django-no-csrf-token.django-no-csrf-token -- capability-token auth: the path secret IS the authority (see routes.py) -->
+<form method="post" action="/recover/{{ token }}/pay" id="payform">
+    <button class="btn" type="submit" id="paybtn">{% if recommended_rail == "upi" %}{{ t('pay_upi', amount=amount) }}{% else %}{{ t('pay_securely', amount=amount) }}{% endif %}</button>
+  </form>
+  <div class="trust">
+    <svg class="lock" width="12" height="14" viewBox="0 0 12 14" fill="none" aria-hidden="true"><rect x="1" y="6" width="10" height="7" rx="1" fill="currentColor"/><path d="M3.5 6V4.5a2.5 2.5 0 0 1 5 0V6" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+    <span>{{ t('trust_secured') }}</span>
+    <span class="marks">UPI · Visa · Mastercard</span>
+  </div>
+  <p class="quiet small" style="margin:var(--sp-3) 0 0">
+    {{ t('pay_note') }} {{ t('pay_other_methods') }}
+  </p>
+
+  {% if promise_due_when %}
+  {# Persistent visibility into the case's own pending commitment — not just
+     a one-time flash right after submitting. States the real date only;
+     never a countdown, same discipline as expires_line below. #}
+  <div class="note">
+    <p>{{ t('promise_pending', when=promise_due_when) }}
+    {% if promise_days_left > 0 %}{{ t('promise_days_left', days=promise_days_left) }}{% else %}{{ t('promise_due_today') }}{% endif %}</p>
+  </div>
+  {% elif last_promise_broken %}
+  {# No hiding: the last commitment broke, said plainly before offering the
+     form again — same no-hiding rule as every other flash on this page. #}
+  <div class="note">
+    <p>{{ t('promise_broken') }}</p>
+  </div>
+  {% endif %}
+
+  {# "Can't pay today?" — the promise affordance. A date promise buys real
+     silence (the engine's never-rule for answered customers), so offering it
+     beside the pay button is honest dunning, not a soft exit. Bounded by the
+     same horizon the voice agent enforces; the POST validates it again. #}
+  <details class="promise-box">
+    <summary>Can't pay today? Promise a date instead</summary>
+    <p class="small quiet">Pick the date you can pay by. We'll pause all
+    reminders until then — no calls, no messages.</p>
+    <!-- nosemgrep: python.django.security.django-no-csrf-token.django-no-csrf-token -- capability-token auth: the path secret IS the authority (see routes.py) -->
+    <form method="post" action="/recover/{{ token }}/promise" class="promise-form">
+      <input type="date" name="due_date" min="{{ promise_min_date }}"
+             max="{{ promise_max_date }}" required
+             aria-label="The date you'll pay by">
+      {# Autopay rides on the promise rather than replacing it: the date is
+         recorded either way, so an unticked box, an abandoned approval or a
+         gateway that is down all leave an ordinary promise standing. Absent
+         entirely above the unattended-debit threshold, where it could not be
+         honoured. #}
+      {% if autopay_offerable %}
+      <label class="autopay">
+        <input type="checkbox" name="autopay" value="1">
+        <span>{{ t.autopay_offer }}</span>
+      </label>
+      <p class="small quiet">{{ t.autopay_detail.format(amount=autopay_amount) }}</p>
+      {% endif %}
+      <button class="btn btn-quiet" type="submit">I'll pay by this date</button>
+    </form>
+  </details>
+
+  {% if risk_timeline_key == "timeline_risk_invoice" %}
+  {# The B2B dialogs — dispute and instalment plan — exist only for invoices:
+     a cart has no "wrong quantity" and no AP desk to plan with. Both are
+     POST endpoints validated server-side (same law as the merchant API);
+     the flashes below name every outcome, same honesty rule as the promise
+     flash. #}
+  {% set dispute_flash = request.query_params.get("dispute") %}
+  {% if dispute_flash == "ok" %}
+    <div class="note settled">
+      <p><strong>Noted — we've paused all reminders on this invoice.</strong>
+      Our team has been told and will review it. Reminders stay off until
+      they answer.</p>
+    </div>
+  {% elif dispute_flash == "invalid" %}
+    <div class="note halt">
+      <p><strong>Tell us what's wrong before we can pause.</strong> Open the
+      dispute box and describe the problem — one line is enough.</p>
+    </div>
+  {% endif %}
+
+  {% set plan_flash = request.query_params.get("plan") %}
+  {% if plan_flash == "ok" %}
+    <div class="note settled">
+      <p><strong>Your plan is in place.</strong> Reminders pause between
+      instalments. Pay each instalment by its date and the follow-ups stay
+      quiet. A missed instalment resumes them.</p>
+    </div>
+  {% elif plan_flash == "invalid" %}
+    <div class="note halt">
+      <p><strong>We couldn't read that plan.</strong> Every instalment needs
+      both a date and an amount, and the amounts must add up to the
+      outstanding total.</p>
+    </div>
+  {% elif plan_flash == "refused" %}
+    <div class="note halt">
+      <p><strong>We can't set that plan.</strong> Plans need 2–6 instalments,
+      adding up to the full amount, within a short honest window. A single
+      date is a promise — use the promise form above for that.</p>
+    </div>
+  {% endif %}
+
+  <details class="promise-box">
+    <summary>Something wrong with this invoice? Dispute it</summary>
+    <p class="small quiet">Telling us what's wrong pauses every reminder on
+    this invoice until our team reviews it. It does not pause the others, and
+    it is not a cancellation.</p>
+    <!-- nosemgrep: python.django.security.django-no-csrf-token.django-no-csrf-token -- capability-token auth: the path secret IS the authority (see routes.py) -->
+    <form method="post" action="/recover/{{ token }}/dispute" class="promise-form">
+      <input type="text" name="reason" maxlength="500" required
+             placeholder="e.g. wrong quantity, already paid by NEFT…"
+             aria-label="What's wrong with this invoice">
+      <button class="btn btn-quiet" type="submit">Send to the team</button>
+    </form>
+  </details>
+
+  <details class="promise-box">
+    <summary>Need to pay in parts? Request an instalment plan</summary>
+    <p class="small quiet">2–6 instalments, adding up to
+      <strong>{{ amount }}</strong>. Each instalment
+      is a dated commitment — reminders pause between them, and a missed one
+      resumes the follow-ups.</p>
+    <!-- nosemgrep: python.django.security.django-no-csrf-token.django-no-csrf-token -- capability-token auth: the path secret IS the authority (see routes.py) -->
+    <form method="post" action="/recover/{{ token }}/plan" class="promise-form" style="flex-direction:column;gap:.4rem">
+      {# Rows 3-6 exist in the markup but start hidden and un-required. The
+         form advertised "2-6 instalments" and hardcoded exactly two, so
+         nobody could ever request three. Hidden rows submit empty and the
+         server skips an empty pair, so with JS off this is the same
+         two-instalment form it has always been — the extra rows are an
+         enhancement, never a requirement. #}
+      {% for i in range(1, max_instalments + 1) %}
+      <label class="small quiet plan-row" style="margin:0"
+             {% if i > 2 %}hidden{% endif %}>Instalment {{ i }}
+        <input type="date" name="instalment_{{ i }}_date" min="{{ promise_min_date }}"
+               {% if i <= 2 %}required{% endif %}
+               aria-label="Instalment {{ i }} date">
+        <input type="number" name="instalment_{{ i }}_amount" min="1" step="0.01"
+               {% if i <= 2 %}required{% endif %}
+               placeholder="Amount (₹)" aria-label="Instalment {{ i }} amount">
+      </label>
+      {% endfor %}
+      <button class="btn btn-quiet" type="button" id="addinst" hidden>Add another instalment</button>
+      <button class="btn btn-quiet" type="submit">Request this plan</button>
+    </form>
+    <script>
+      // Progressive enhancement: reveal one more row per click, up to the
+      // server's own cap. The button itself is hidden in markup and unhidden
+      // here, so a JS-off reader never sees a control that does nothing.
+      (function () {
+        var add = document.getElementById('addinst');
+        if (!add) return;
+        var rows = Array.prototype.slice.call(
+          document.querySelectorAll('.plan-row'));
+        add.hidden = false;
+        add.addEventListener('click', function () {
+          for (var i = 0; i < rows.length; i++) {
+            if (!rows[i].hidden) continue;
+            rows[i].hidden = false;
+            var f = rows[i].querySelectorAll('input');
+            // Required only once visible: a hidden required input blocks
+            // submission with an error the reader cannot see or reach.
+            for (var j = 0; j < f.length; j++) f[j].required = true;
+            break;
+          }
+          // The cap is the server's (MAX_INSTALMENTS); this only stops the
+          // reader from asking for a row the server would refuse anyway.
+          if (!rows.filter(function (r) { return r.hidden; }).length) {
+            add.hidden = true;
+          }
+        });
+      })();
+    </script>
+  </details>
+  {% endif %}
+  {% if expires_line %}
+  {# No `| safe`: the date is rendered through normal autoescaping. The old
+     form injected raw `</span>…<span>` around the value and marked the whole
+     string safe — an XSS anti-pattern (and malformed HTML) even though the
+     value is a strftime date today. Autoescape keeps it safe whatever the
+     value ever becomes. #}
+  <p class="expires">{{ t('expires_line', when=expires_line) }}</p>
+  {% endif %}
+{% endif %}
+
+{# The way to everything else this person has open with us. Offered only when
+   there IS something else — a link promising "everything you owe" that leads
+   to a page holding this same one payment is worse than no link. The route
+   mints the token; the template never mints a credential. #}
+{% if mine_link %}
+<p class="small" style="margin-top:var(--sp-3)">
+  <a href="{{ mine_link }}">{{ t('mine_see_all_n', n=mine_count + 1) }}</a>
+</p>
+{% endif %}
+
+<div class="sec"><h2>{{ t('sec_this_payment') }}</h2></div>
+<dl class="register">
+  <div><dt>Reference</dt><dd>{{ order_ref }}</dd></div>
+  {% if method %}<div><dt>Method</dt><dd>{{ method }}{% if bank %} · {{ bank }}{% endif %}</dd></div>{% endif %}
+  {% if failed_at %}<div><dt>{{ t('register_attempted') if is_payment else t('register_opened') }}</dt><dd>{{ failed_at.strftime("%d %b %Y, %H:%M") }}</dd></div>{% endif %}
+  {% if due_when %}
+  {# Invoices only. The ladder and the console have escalated on days-past-due
+     since the receivables layer landed; the person being chased for it was
+     the only one who could not see it. Server-computed, and silent until the
+     date actually passes — same honest-deadline rule as expires_line. #}
+  <div><dt>{{ t('register_due') }}</dt><dd>{{ due_when }}{% if days_overdue %} · {{ t('days_overdue', days=days_overdue) }}{% endif %}</dd></div>
+  {% endif %}
+</dl>
+{% if state == "payable" %}
+<details>
+  <summary>{{ t('faq_safe_q') }}</summary>
+  <p class="small quiet" style="margin-top:.5rem">{{ t('faq_safe_a') }}</p>
+</details>
+{% if is_payment %}
+<details>
+  <summary>{{ t('faq_charged_q') }}</summary>
+  <p class="small quiet" style="margin-top:.5rem">{{ t('faq_charged_a') }}</p>
+</details>
+{% endif %}
+{% include "_help_and_optout.html" %}
+{% endif %}
+
+{% if state == "payable" %}
+<script>
+  // Progressive enhancement only. The server re-reads the case on every POST
+  // and refuses anything that is not payable, so this guard is a courtesy that
+  // stops the spinner-tap, not the thing preventing a double charge.
+  (function () {
+    var f = document.getElementById('payform'), b = document.getElementById('paybtn');
+    if (!f || !b) return;
+    f.addEventListener('submit', function () {
+      b.setAttribute('aria-disabled', 'true');
+      b.textContent = {{ t('pay_opening') | tojson }};
+      setTimeout(function () { b.disabled = true; }, 0);
+    });
+  })();
+</script>
+{% endif %}
+{% endblock %}
+
+{% block footer %}
+  {{ t('help_footer') }}
+  <span class="mono">{{ order_ref }}</span>.
+  {% if whatsapp %}
+  <a href="https://wa.me/{{ whatsapp }}" rel="nofollow noopener" target="_blank">WhatsApp</a>
+  {% endif %}
+{% endblock %}

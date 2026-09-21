@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+.venv.bak/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment — any .env variant, incl. editor/script backups
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite3
+
+# Models
+models/*.joblib
+models/*.pkl
+
+# Eval results ARE committed on purpose — the README cites them as the evidence
+# for every number it states, so a fresh clone must contain them. Regenerate with:
+#   python -m eval.runner --scenarios 5000 --seeds 5 --skip-llm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Node (typescript/ replica)
+node_modules/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# A downloaded zip of this repo extracted inside itself. Committed once by
+# accident (108 files, identical to the root) and it broke ruff and mypy with
+# duplicate-module errors until it was removed.
+payment-recovery-engine-main/
+*-main/
+
+# Local Claude Code config — not shared.
+.claude/
+.claude-flow/
+
+# Regenerable knowledge-graph cache (1.6M of content-hashed AST blobs).
+graphify-out/
+
+# requirements.lock.txt is the lockfile the Dockerfile and CI actually install
+# from. uv.lock is a second, unreferenced one — two lockfiles drift in silence.
+uv.lock
+
+# local analysis artifacts
+.mutmut-cache
+.schemathesis/
+preview/
+
+# Machine-local resume cache for the LLM eval prefetch (accumulates real
+# decisions across free-tier daily-quota-limited runs). Not a result artifact.
+eval/results/.llm_decision_cache.jsonl
+
+# Local demo (./run.sh --demo)
+.demo.sqlite3
+.demo.seeded
+.sandbox.sqlite3
+.sandbox.seeded
+
+# Local agent-tooling scratch (RuVector/AgentDB). Binary, machine-local, and
+# regenerated on demand — nothing here is a project artifact.
+agentdb.rvf
+agentdb.rvf.lock
+
+# Local tooling state — a project id belonging to a tool, not to this repo.
+.freebuff/

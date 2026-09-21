@@ -1,0 +1,151 @@
+{
+  "retry_cost_inr": 2.0,
+  "policies": {
+    "No Retry": {
+      "recovery_rate_%": 0.0,
+      "recovery_rate_%_std": 0.0,
+      "retry_cost_avg": 0.0,
+      "retry_cost_avg_std": 0.0,
+      "false_retry_rate_%": 0.0,
+      "false_retry_rate_%_std": 0.0,
+      "time_to_recovery_min": null,
+      "time_to_recovery_min_std": null,
+      "\u20b9_per_\u20b91Cr_failed": 0.0,
+      "\u20b9_per_\u20b91Cr_failed_std": 0.0,
+      "attempts_per_\u20b91Cr": 0.0,
+      "attempts_per_\u20b91Cr_std": 0.0,
+      "net_\u20b9_per_\u20b91Cr_failed": 0.0,
+      "net_\u20b9_per_\u20b91Cr_failed_std": 0.0
+    },
+    "Fixed 3-Retry": {
+      "recovery_rate_%": 19.21,
+      "recovery_rate_%_std": 0.66,
+      "retry_cost_avg": 2.73,
+      "retry_cost_avg_std": 0.01,
+      "false_retry_rate_%": 8.03,
+      "false_retry_rate_%_std": 0.33,
+      "time_to_recovery_min": 15.0,
+      "time_to_recovery_min_std": 0.0,
+      "\u20b9_per_\u20b91Cr_failed": 1849489.0,
+      "\u20b9_per_\u20b91Cr_failed_std": 84214.84,
+      "attempts_per_\u20b91Cr": 26872.8,
+      "attempts_per_\u20b91Cr_std": 485.17,
+      "net_\u20b9_per_\u20b91Cr_failed": 1795743.6,
+      "net_\u20b9_per_\u20b91Cr_failed_std": 83842.82
+    },
+    "XGBoost": {
+      "recovery_rate_%": 30.24,
+      "recovery_rate_%_std": 0.51,
+      "retry_cost_avg": 2.32,
+      "retry_cost_avg_std": 0.0,
+      "false_retry_rate_%": 0.0,
+      "false_retry_rate_%_std": 0.0,
+      "time_to_recovery_min": 0.0,
+      "time_to_recovery_min_std": 0.0,
+      "\u20b9_per_\u20b91Cr_failed": 3011938.0,
+      "\u20b9_per_\u20b91Cr_failed_std": 120459.32,
+      "attempts_per_\u20b91Cr": 22844.2,
+      "attempts_per_\u20b91Cr_std": 448.74,
+      "net_\u20b9_per_\u20b91Cr_failed": 2966249.4,
+      "net_\u20b9_per_\u20b91Cr_failed_std": 120599.89
+    },
+    "LLM Agent": {
+      "recovery_rate_%": 26.55,
+      "recovery_rate_%_std": 0.46,
+      "retry_cost_avg": 2.38,
+      "retry_cost_avg_std": 0.01,
+      "false_retry_rate_%": 0.0,
+      "false_retry_rate_%_std": 0.01,
+      "time_to_recovery_min": 0.0,
+      "time_to_recovery_min_std": 0.0,
+      "\u20b9_per_\u20b91Cr_failed": 2644429.6,
+      "\u20b9_per_\u20b91Cr_failed_std": 101375.31,
+      "attempts_per_\u20b91Cr": 23413.4,
+      "attempts_per_\u20b91Cr_std": 513.08,
+      "net_\u20b9_per_\u20b91Cr_failed": 2597603.2,
+      "net_\u20b9_per_\u20b91Cr_failed_std": 101285.06
+    }
+  },
+  "paired_vs_baseline": {
+    "No Retry": {
+      "recovery_rate_pp": {
+        "mean_delta": -19.212,
+        "ci95_halfwidth": 0.488,
+        "ci95": [
+          -19.7,
+          -18.724
+        ],
+        "n_paired": 25000,
+        "significant": true
+      },
+      "retry_cost": {
+        "mean_delta": -2.729,
+        "ci95_halfwidth": 0.008,
+        "ci95": [
+          -2.737,
+          -2.721
+        ],
+        "n_paired": 25000,
+        "significant": true
+      }
+    },
+    "XGBoost": {
+      "recovery_rate_pp": {
+        "mean_delta": 11.032,
+        "ci95_halfwidth": 0.489,
+        "ci95": [
+          10.543,
+          11.521
+        ],
+        "n_paired": 25000,
+        "significant": true
+      },
+      "retry_cost": {
+        "mean_delta": -0.409,
+        "ci95_halfwidth": 0.012,
+        "ci95": [
+          -0.421,
+          -0.397
+        ],
+        "n_paired": 25000,
+        "significant": true
+      }
+    },
+    "LLM Agent": {
+      "recovery_rate_pp": {
+        "mean_delta": 7.34,
+        "ci95_halfwidth": 0.443,
+        "ci95": [
+          6.897,
+          7.783
+        ],
+        "n_paired": 25000,
+        "significant": true
+      },
+      "retry_cost": {
+        "mean_delta": -0.351,
+        "ci95_halfwidth": 0.012,
+        "ci95": [
+          -0.363,
+          -0.34
+        ],
+        "n_paired": 25000,
+        "significant": true
+      }
+    }
+  },
+  "economics_vs_baseline": {
+    "XGBoost": {
+      "delta_revenue_per_crore": 1162449.0,
+      "delta_attempts_per_crore": -4029.0,
+      "break_even_cost_per_retry_inr": null,
+      "verdict": "dominates at any retry cost (incl. \u20b90)"
+    },
+    "LLM Agent": {
+      "delta_revenue_per_crore": 794941.0,
+      "delta_attempts_per_crore": -3459.0,
+      "break_even_cost_per_retry_inr": null,
+      "verdict": "dominates at any retry cost (incl. \u20b90)"
+    }
+  }
+}

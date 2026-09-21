@@ -1,0 +1,17 @@
+{# Shown for expired, forged and unknown tokens alike — see routes.py. #}
+{% extends "base.html" %}
+{% block title %}Link expired{% endblock %}
+{% block content %}
+<h1>This link has expired</h1>
+<div class="note hold">
+  <p><strong>Recovery links stop working after a few days</strong>, so they
+  can't be reused if the message is forwarded or found later.</p>
+</div>
+<p>No money has left your account through this link. If you still need to pay,
+reply to the message we sent you and we'll send a fresh one.</p>
+{% endblock %}
+
+{% block footer %}
+  We can't show payment details for an expired link. That is deliberate, so a
+  forwarded message reveals nothing.
+{% endblock %}
